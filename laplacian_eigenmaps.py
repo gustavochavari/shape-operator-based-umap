@@ -67,8 +67,14 @@ class LaplacianEigenmaps():
         #elif self.laplacian == 'random':
             # Compute random walk normalized Laplacian: L_rw = D^(-1)L = I - D^(-1)W
 
-        #elif self.laplacian == 'symmetrized':
+        elif self.laplacian == 'symmetrized':
             # Compute symmetrically normalized Laplacian: L_sym = D^(-1/2)LD^(-1/2)
+
+            D_sq = np.diag(1.0 / np.sqrt(np.diag(D)))
+
+            L_sym = D_sq@ L @ D_sq
+
+            eigvals, eigvecs = eigh(L_sym)
 
         
         # Sort eigenvalues and eigenvectors

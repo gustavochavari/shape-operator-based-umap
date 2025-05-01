@@ -1,0 +1,5 @@
+matplotlib>=3.3.0
+numpy>=1.20.0
+pynndescent==0.5.8
+scikit-learn>=0.24.0
+scipy>=1.6.0

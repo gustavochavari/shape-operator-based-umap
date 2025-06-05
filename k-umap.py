@@ -25,8 +25,10 @@ from sklearn.manifold import SpectralEmbedding
 from sklearn.manifold import Isomap
 from sklearn.manifold import LocallyLinearEmbedding as LLE  
 from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.neighbors import kneighbors_graph
 from sklearn import preprocessing
 from sklearn import metrics
+from microstructpy import geometry
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
@@ -39,13 +41,14 @@ from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.mixture import GaussianMixture
 from sklearn.cluster import KMeans
+from sklearn.neighbors import NearestNeighbors
 
 # Para evitar erro de SSL do fetch_openml
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # Global configuration variables
-N_NEIGHBOR = 15
+N_NEIGHBOR = 30
 MIN_DIST = 0.1
 N_LOW_DIMS = 2
 LEARNING_RATE = 1
@@ -60,16 +63,39 @@ def prob_high_dim(dist, rho, sigma, dist_row):
      (1D array)
     """
     d = dist[dist_row] - rho[dist_row]
-    d[d < 0] = 0
+    d = np.maximum(d, 0)
+
     return np.exp(- d / sigma)
 
 
 def k(prob):
     """
-    Computa n_neighbor = k (escalar) para cada array de probabilidades de alta dimensionalidade
+    Computa n_neighbor = k (smooth) para cada array de probabilidades de alta dimensionalidade
     """
     return np.power(2, np.sum(prob))
 
+def new_sigma_binary_search(func,target):
+    sigma_low = 0.0
+    sigma_high = np.inf
+    sigma = 1.0  # Valor inicial
+
+    for _ in range(64):
+        val = func(sigma)
+        
+        if np.abs(val - target) < 1e-5:
+            break
+        
+        if val > target:
+            sigma_high = sigma
+            sigma = (sigma_low + sigma_high) / 2
+        else:
+            sigma_low = sigma
+            if sigma_high == np.inf:
+                sigma *= 2
+            else:
+                sigma = (sigma_low + sigma_high) / 2
+    
+    return sigma
 
 def sigma_binary_search(k_of_sigma, fixed_k):
     """
@@ -78,7 +104,7 @@ def sigma_binary_search(k_of_sigma, fixed_k):
     """
     sigma_lower_limit = 0
     sigma_upper_limit = 1000
-    for i in range(20):
+    for i in range(64):
         approx_sigma = (sigma_lower_limit + sigma_upper_limit) / 2
         if k_of_sigma(approx_sigma) < fixed_k:
             sigma_lower_limit = approx_sigma
@@ -161,26 +187,48 @@ def umap(dados, target):
     print('************************************\n')
     n = dados.shape[0]
     m = dados.shape[1]
-    c = len(np.unique(target))  
-    # Calcula as distâncias euclidianas ponto a ponto
-    dist = np.square(euclidean_distances(dados, dados))
-    rho = [sorted(dist[i])[1] for i in range(dist.shape[0])]
+    c = len(np.unique(target))
+
+    #### Constructing a local fuzzy simplicial set ####
+
+    # Tentar colocar o grafo kNN para otimizar memória?
+    # Porém, ao trocar a matriz de euclidean distances ele funciona direito (ver plots)
+    knn = NearestNeighbors(n_neighbors=15, metric='euclidean')
+    knn.fit(dados)
+    dist, indices = knn.kneighbors(dados)
+
+    # dist = np.square(euclidean_distances(dados, dados))
+
+    # The local connectivity adjustment
+    rho = np.array([sorted(dist[i])[1] for i in range(dist.shape[0])])
+
     # Computa a matriz no espaço de alta dimensionalidade   
     prob = np.zeros((n,n))
+
     sigma_array = []
     for dist_row in range(n):
-        func = lambda sigma: k(prob_high_dim(dist, rho, sigma, dist_row))
-        binary_search_result = sigma_binary_search(func, N_NEIGHBOR)
-        prob[dist_row] = prob_high_dim(dist, rho, binary_search_result, dist_row)
-        sigma_array.append(binary_search_result)
+        for idx in indices:
+            # Define uma função que recebe sigma e retorna o valor de k suave
 
-        if (dist_row + 1) % 500 == 0:
-            print("Busca binária do Sigma terminada em {0} de {1} amostras".format(dist_row + 1, n))
+            func = lambda sigma: k(prob_high_dim(dist, rho, sigma, dist_row))
+
+            binary_search_result = sigma_binary_search(func, N_NEIGHBOR)
+
+            prob[dist_row,idx] = prob_high_dim(dist, rho, binary_search_result, dist_row)
+            
+            sigma_array.append(binary_search_result)
+
+            if (dist_row + 1) % 500 == 0:
+                print("Busca binária do Sigma terminada em {0} de {1} amostras".format(dist_row + 1, n))
     print("\nSigma = " + str(np.mean(sigma_array)))
 
     # Duas formas de calcular a matriz de probabilidades
-    #P = prob + np.transpose(prob) - np.multiply(prob, np.transpose(prob))
-    P = (prob + np.transpose(prob)) / 2        # Igual ao t-SNE (melhor)    
+    # P = prob + np.transpose(prob) - np.multiply(prob, np.transpose(prob)) (igual ao do artigo)
+
+    # Igual ao t-SNE (melhor)
+    P = (prob + np.transpose(prob)) / 2         
+
+    ############################## SPECTRAL EMBEDDING ################################
     # Hiperparâmetros
     a = 1.93
     b = 0.79
@@ -204,6 +252,52 @@ def umap(dados, target):
             print("Cross-Entropy = " + str(CE_current) + " depois de " + str(i) + " iterações")
     print("Finished UMAP")
     return (CE_array, y)
+
+def fit_nsphere(X):
+    sphere = geometry.n_sphere.NSphere.best_fit(X)
+    
+    return sphere.radius
+    
+def robust_cov_eig(amostras, min_reg=1e-6):
+    """
+    Calcula a matriz de covariância regularizada e retorna autovalores/autovetores.
+    Garante simetria e evita problemas de singularidade.
+    """
+    m = amostras.shape[1]
+    if amostras.shape[0] <= 1:
+        # Patch muito pequeno: retorna identidade
+        return np.ones(m), np.eye(m)
+    cov = np.cov(amostras.T)
+    # Garante simetria numérica
+    cov = (cov + cov.T) / 2
+    # Regularização adaptativa
+    reg = min_reg
+    while True:
+        try:
+            vals, vecs = np.linalg.eigh(cov + reg * np.eye(m))
+            break
+        except np.linalg.LinAlgError:
+            reg *= 10
+            if reg > 1:
+                # fallback: identidade
+                return np.ones(m), np.eye(m)
+    return vals, vecs
+
+def SphereCurvature(dados,k,d=None):
+    n = dados.shape[0]
+    m = dados.shape[1]
+    knnGraph = sknn.kneighbors_graph(dados, n_neighbors=k, mode='distance')
+    A = knnGraph.toarray()
+    
+    R = []
+    for i in range(n):
+        vizinhos = A[i, :] - np.mean(A[i, :],axis=0)
+        indices = vizinhos.nonzero()[0]
+        r_i = fit_nsphere(dados[indices])
+        R.append(1/r_i**2)
+
+    
+    return R
 
 
 def gs(X, row_vecs=True, norm = True):
@@ -322,10 +416,11 @@ def k_umap(dados, target):
     MIN_NEIGH = 3
     # Calcula as curvaturas locais
     print("Calculando curvaturas locais")
-    curvaturas = Curvature_Estimation(dados, N_NEIGHBOR)
+    #curvaturas = Curvature_Estimation(dados, N_NEIGHBOR)
+    K = SphereCurvature(dados, N_NEIGHBOR)
     #print(curvaturas)
     print("Normalizando curvaturas")
-    K = normalize_curvatures(curvaturas)
+    #K = normalize_curvatures(curvaturas)
     #print(min(K))
     #print(max(K))
     intervalos = np.linspace(min(K), max(K), N_NEIGHBOR-MIN_NEIGH)
@@ -355,7 +450,7 @@ def k_umap(dados, target):
             # K[i] = 2.5
     #K = np.tile(K, [2, 1])
     #print(K.shape)
-    dist = np.square(euclidean_distances(dados, dados))
+    dist = np.square(euclidean_distances(dados,dados))
     rho = [sorted(dist[i])[1] for i in range(dist.shape[0])]
     # Computa a matriz no espaço de alta dimensionalidade   
     prob = np.zeros((n,n))
@@ -575,7 +670,7 @@ def main():
     warnings.simplefilter(action='ignore')
 
     # Leitura dos dados
-    #X = skdata.load_iris()     # 15 - all
+    X = skdata.load_iris()     # 15 - all
     #X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
     #X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
@@ -585,7 +680,7 @@ def main():
     #X = skdata.fetch_openml(name='optdigits', version=1)        # 15 - all
     #X = skdata.fetch_openml(name='synthetic_control', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='har', version=1)                 # 15 - all
-    X = skdata.fetch_openml(name='schizo', version=1)              # 15 - all
+    #X = skdata.fetch_openml(name='schizo', version=1)              # 15 - all
     #X = skdata.fetch_openml(name='11_Tumors', version=1)           # 15 - all
     #X = skdata.fetch_openml(name='one-hundred-plants-margin', version=1)   # 15 - all
 
@@ -703,8 +798,9 @@ def main():
     # Métricas de avaliação para UMAP com distância de Mahalanobis
     k_umap_metrics = EvaluationMetrics(dados_k_umap, target, 'K-UMAP')
 
+    
     # Tenta obter o nome do dataset
-    dataset_name = X['details']['name']
+    dataset_name = X.get('details', {}).get('name', 'N/A')
 
     # Novo resultado a ser adicionado
     new_result = {

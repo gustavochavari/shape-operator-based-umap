@@ -126,5 +126,69 @@
             "Max_F1_weighted": 0.6203565396001435,
             "Max_Jaccard": 0.48883729131105447
         }
+    },
+    "optdigits": {
+        "UMAP (Euclidean)": {
+            "Silhouette": 0.4216629991392792,
+            "Calinski_Harabasz": 1133.891380274263,
+            "Davies_Bouldin": 1.4305287908787805,
+            "Rand_index": 0.9378096136103253,
+            "Fowlkes_Mallows": 0.7189385771870611,
+            "Mutual_info": 1.7681811202747844,
+            "V_measure": 0.7860094363878922,
+            "Max_balanced_accuracy": 0.8428926344729966,
+            "Max_kappa": 0.830802832361621,
+            "Max_precision": 0.9209642715861465,
+            "Max_recall": 0.8477951635846372,
+            "Max_F1_weighted": 0.8496346000428494,
+            "Max_Jaccard": 0.7624405466359084
+        },
+        "K-UMAP": {
+            "Silhouette": -0.023792259675243635,
+            "Calinski_Harabasz": 179.51050759573832,
+            "Davies_Bouldin": 5.3233863052657036,
+            "Rand_index": 0.8559803712828624,
+            "Fowlkes_Mallows": 0.28547912643916945,
+            "Mutual_info": 0.7736945800867346,
+            "V_measure": 0.33700926945314946,
+            "Max_balanced_accuracy": 0.6946072476737543,
+            "Max_kappa": 0.661690132610128,
+            "Max_precision": 0.6987644933991303,
+            "Max_recall": 0.6955903271692745,
+            "Max_F1_weighted": 0.6960410273842966,
+            "Max_Jaccard": 0.5445841127334079
+        }
+    },
+    "N/A": {
+        "UMAP (Euclidean)": {
+            "Silhouette": -0.10672388970960216,
+            "Calinski_Harabasz": 1.1403815741604246,
+            "Davies_Bouldin": 7.577142265999824,
+            "Rand_index": 0.385503355704698,
+            "Fowlkes_Mallows": 0.526518539266749,
+            "Mutual_info": 0.02378004183551223,
+            "V_measure": 0.03324537635419073,
+            "Max_balanced_accuracy": 0.34192037470725994,
+            "Max_kappa": 0.008553654743390315,
+            "Max_precision": 0.6913343328335831,
+            "Max_recall": 0.32,
+            "Max_F1_weighted": 0.39801058201058204,
+            "Max_Jaccard": 0.25476923076923075
+        },
+        "K-UMAP": {
+            "Silhouette": 0.3939789093300202,
+            "Calinski_Harabasz": 117.82351767462293,
+            "Davies_Bouldin": 0.9241538992038896,
+            "Rand_index": 0.8922595078299776,
+            "Fowlkes_Mallows": 0.8384647991144092,
+            "Mutual_info": 0.8455139210272689,
+            "V_measure": 0.7743507390201577,
+            "Max_balanced_accuracy": 0.9861111111111112,
+            "Max_kappa": 0.9798711755233495,
+            "Max_precision": 0.9872463768115942,
+            "Max_recall": 0.9866666666666667,
+            "Max_F1_weighted": 0.9866729708431836,
+            "Max_Jaccard": 0.9739130434782608
+        }
     }
 }

@@ -368,7 +368,7 @@ def k_umap(dados, target, N_NEIGHBOR):
     K = normalize_curvatures(K)
     #print(min(K))
     #print(max(K))
-    intervalos = np.linspace(min(K), max(K), 9)
+    intervalos = np.linspace(min(K), max(K), N_NEIGHBOR-5)
     quantis = np.quantile(K, intervalos)
     bins = np.array(quantis)
     # Discrete curvature values obtained after quantization (scores)
@@ -621,7 +621,7 @@ def main():
     #X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
     #X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
-    #X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
+    X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
     #X = skdata.fetch_openml(name='page-blocks', version=1)      # 15 - all
     #X = skdata.fetch_openml(name='Kuzushiji-MNIST', version=1)  # 15 - all
     #X = skdata.fetch_openml(name='optdigits', version=1)        # 15 - all
@@ -634,7 +634,7 @@ def main():
     #X = skdata.load_digits()    # sqrt - all
     #X = skdata.fetch_openml(name='mfeat-fourier', version=1)    # sqrt - all
     #X = skdata.fetch_openml(name='mfeat-factors', version=1)    # sqrt - all
-    X = skdata.fetch_openml(name='semeion', version=1)          # sqrt - all
+    #X = skdata.fetch_openml(name='semeion', version=1)          # sqrt - all
     #X = skdata.fetch_openml(name='micro-mass', version=1)       # sqrt - all
     #X = skdata.fetch_openml(name='MNIST_784', version=1)        # sqrt - all
     #X = skdata.fetch_openml(name='pendigits', version=1)        # sqrt - all

@@ -54,9 +54,9 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # Global configuration variables
-MIN_DIST = 0.03
+MIN_DIST = 0.1
 N_LOW_DIMS = 2
-N_EPOCHS = 2
+N_EPOCHS = 100
 LEARNING_RATE = 1.0
 N_NEG_SAMPLES = 5 
 
@@ -180,8 +180,7 @@ def find_ab_params(spread=1.0, min_dist=0.1):
 #     return gradient
 
 # MODIFICADO: A função de gradiente em lote foi removida.
-# A função abaixo implementa a otimização via SGD.
-
+# A função abaixo implementa a otimização via SGD.'
 def umap_sgd_optimization(P_sparse, y_init, n_epochs, initial_alpha, a, b, n_neg_samples,log_loss=True):
     """
     Otimiza o embedding 'y' usando Descida de Gradiente Estocástica com amostragem negativa.
@@ -228,14 +227,18 @@ def umap_sgd_optimization(P_sparse, y_init, n_epochs, initial_alpha, a, b, n_neg
                 grad_coeff /= (1.0 + a * (dist_sq ** b))
             else:
                 grad_coeff = 0.0
+
             grad = grad_coeff * (y_h - y_t)
 
             # Apply the attractive gradient
             y[h_idx] += grad * alpha
+
+            # Wheter to adjust tail_embedding alongside head_embedding
             y[t_idx] -= grad * alpha
 
             # --- Calculate Repulsive Force and Loss ---
             neg_indices = np.random.randint(0, n, size=n_neg_samples)
+
             for neg_idx in neg_indices:
                 if neg_idx == h_idx:
                     continue
@@ -252,7 +255,7 @@ def umap_sgd_optimization(P_sparse, y_init, n_epochs, initial_alpha, a, b, n_neg
 
                 # Calculate gradient for repulsive force
                 if dist_sq_neg > 0.0:
-                    grad_coeff_neg = 2.0 * b
+                    grad_coeff_neg = 2.0 * b  # gamma = 1
                     grad_coeff_neg /= (0.001 + dist_sq_neg) * (1.0 + a * (dist_sq_neg ** b))
                 else:
                     grad_coeff_neg = 0.0
@@ -269,7 +272,6 @@ def umap_sgd_optimization(P_sparse, y_init, n_epochs, initial_alpha, a, b, n_neg
             loss_history.append(total_loss)
 
     return loss_history, y
-
 
 def umap(dados, target, N_NEIGHBOR):
     """
@@ -321,7 +323,7 @@ def umap(dados, target, N_NEIGHBOR):
     P = (prob + prob.T).tocsr() / 2         
 
     ############################## SPECTRAL EMBEDDING ################################
-    a, b = find_ab_params()
+    a, b = find_ab_params(1,MIN_DIST)
 
     print(f"Hiperparâmetros a = {a} and b = {b}")    
     np.random.seed(12345)
@@ -452,7 +454,7 @@ def percentile_rank(K, n_neighbors):
             n_bins = list(bin_range)[np.argmax(entropies)]
 
     # Use fixed-width bins instead of quantile bins
-    bins = np.linspace(np.min(K), np.max(K), n_bins + 1)
+    bins = np.linspace(np.min(K), np.max(K), n_bins)
     ranks = np.digitize(K, bins, right=False)
 
     return ranks
@@ -485,6 +487,7 @@ def k_umap(dados, target, N_NEIGHBOR):
     unique_values, counts = np.unique(K, return_counts=True)
 
     # Or combine them for better readability
+    print("Ranking de curvatura (Rank: Quantidade)")
     for value, count in zip(unique_values, counts):
         print(f"{value}: {count}")
 
@@ -526,7 +529,7 @@ def k_umap(dados, target, N_NEIGHBOR):
     P = (prob + prob.T).tocsr() / 2         
 
     ############################## SPECTRAL EMBEDDING ################################
-    a, b = find_ab_params()
+    a, b = find_ab_params(1,MIN_DIST)
 
     print(f"Hiperparâmetros a = {a} and b = {b}")    
     np.random.seed(12345)
@@ -654,8 +657,8 @@ def main():
     #X = skdata.load_iris()     # 15 - all
     #X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
     #X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
-    X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
-    #X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
+    #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
+    X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
     #X = skdata.fetch_openml(name='page-blocks', version=1)      # 15 - all
     #X = skdata.fetch_openml(name='Kuzushiji-MNIST', version=1)  # 15 - all
     #X = skdata.fetch_openml(name='optdigits', version=1)        # 15 - all
@@ -714,7 +717,7 @@ def main():
     le = LabelEncoder()
     target = le.fit_transform(target)
 
-    if dados.shape[0] > 5000:
+    if dados.shape[0] > 6000:
         print(f"Dataset grande. Reduzindo de {dados.shape[0]} para 5000 amostras.")
         dados, _, target, _ = train_test_split(dados, target, train_size=5000, random_state=42, stratify=target)
     

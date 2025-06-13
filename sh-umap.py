@@ -1,22 +1,25 @@
 '''
-    K-UMAP: um algoritmo iterativo para aprendizado não supervisionado
+    SH-UMAP: um algoritmo iterativo para aprendizado não supervisionado
     de métricas baseado na curvatura local
 
     Protótipo em Python do método a ser desenvolvido
 '''
-
+import numba
 import os
 import json
 import sys
 import warnings
 import numpy as np
+from sklearn.model_selection import KFold
 import pandas as pd
 import scipy.sparse as sp
 from scipy.sparse import lil_matrix, csr_matrix
 from scipy.optimize import curve_fit
 import sklearn.neighbors as sknn
 import matplotlib.pyplot as plt
+from scipy import stats
 import sklearn.datasets as skdata
+from sklearn.neighbors import LocalOutlierFactor
 from matplotlib import colors
 from numpy.linalg import inv
 from numpy.linalg import cond
@@ -54,12 +57,11 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # Global configuration variables
 MIN_DIST = 0.1
 N_LOW_DIMS = 2
-N_EPOCHS = 50 # MODIFICADO: Renomeado de MAX_ITER para n_epochs para refletir a nova abordagem
+N_EPOCHS = 1000
 LEARNING_RATE = 1.0
-N_NEG_SAMPLES = 5 # Número de amostras negativas por amostra positiva
+N_NEG_SAMPLES = 5 
 
-# Similar to n_epochs (the standard is 500 for n_samples < 10000 and 200 for large datasets )
-# Now controls only sigma binary search
+# Sigma binary search
 MAX_ITER = 120
 
 #####################################################
@@ -116,25 +118,6 @@ def f(x, min_dist):
         else:
             y.append(np.exp(- x[i] + min_dist))
     return y
-
-
-def prob_low_dim(Y, a, b, distance='euclidean'):
-    """
-    Computa a matriz de probabilidades q_ij no espaço de baixa dimensão
-    """
-    if distance == 'mahalanobis':
-        m = Y.shape[1]
-        sigma = np.cov(Y.T)
-        # Se necessário, regulariza matriz de convariâncias
-        if cond(sigma) > 1/sys.float_info.epsilon:
-            sigma += np.diag(0.0001*np.ones(m))
-        inv_sigma = inv(sigma)
-        distances = cdist(Y, Y, 'mahalanobis', VI=sigma)
-    else:
-        distances = euclidean_distances(Y, Y)
-    # Calcula inverso das distâncias
-    inv_distances = np.power(1 + a * np.square(distances)**b, -1)
-    return inv_distances
 
 def find_ab_params(spread=1.0, min_dist=0.1):
     """Fit a, b params for the UMAP low dimensional curve"""
@@ -198,146 +181,123 @@ def find_ab_params(spread=1.0, min_dist=0.1):
 #     return gradient
 
 # MODIFICADO: A função de gradiente em lote foi removida.
-# A função abaixo implementa a otimização via SGD.
-
-# ---------- Funções de perda ----------
-# ---------- Funções de perda ----------
-def calculate_sampled_loss(y, sampled_positives, sampled_negatives, a, b):
-    """Calculates the 'actual' loss based on sampled positive and negative edges."""
-    distances = euclidean_distances(y, y)
-    nu = 1.0 / (1.0 + a * distances**b)
-
-    loss = 0.0
-    for i, j in sampled_positives:
-        loss += -np.log(nu[i, j] + 1e-8)
-    for i, j in sampled_negatives:
-        loss += -np.log(1.0 - nu[i, j] + 1e-8)
-    return loss
-
-def calculate_effective_loss(y, P_sparse, a, b, m):
-    """Calculates the 'effective' UMAP loss."""
-    distances = euclidean_distances(y, y)
-    nu = 1.0 / (1.0 + a * distances**b)
-
-    P_coo = P_sparse.tocoo()
-    mu = P_coo.data
-    head, tail = P_coo.row, P_coo.col
-
-    n = y.shape[0]
-    deg = np.array(P_sparse.sum(axis=1)).flatten()
-    loss = 0.0
-
-    for i, j, mu_ij in zip(head, tail, mu):
-        if i >= j: continue
-        L_a = -mu_ij * np.log(nu[i, j] + 1e-8)
-        weight_r = ((deg[i] + deg[j]) * m) / (2.0 * n)
-        L_r = -weight_r * np.log(1.0 - nu[i, j] + 1e-8)
-        loss += 2 * (L_a + L_r)
-    return loss
-
-
-def umap_sgd_optimization(P_sparse, y_init, n_epochs, lr, a, b, n_neg_samples, dataset_name='dataset'):
+# A função abaixo implementa a otimização via SGD.'
+# - MODIFICATION: Added the Numba JIT decorator. 
+#   This is the most important change for performance.
+#   fastmath=True allows for some floating point optimizations.
+@numba.njit(fastmath=True)
+def umap_sgd_optimization(
+    y_init,
+    head,
+    tail,
+    n_epochs,
+    initial_alpha,
+    a,
+    b,
+    n_neg_samples,
+    log_loss=True
+):
     """
-    Otimiza o embedding 'y', calcula as perdas em cada época e plota a evolução.
+    Otimiza o embedding 'y' usando Descida de Gradiente Estocástica com amostragem negativa.
+    Esta versão é otimizada com Numba.
     """
-    y = y_init.copy()
+    # - MODIFICATION: Explicitly copy and set the data type to float32.
+    #   This uses less memory and is often faster.
+    y = y_init.copy().astype(np.float32)
+    alpha = np.float32(initial_alpha)
+    a = np.float32(a)
+    b = np.float32(b)
+    
     n = y.shape[0]
+    n_edges = len(head)
 
-    # Extrai vizinhos para amostragem positiva
-    neighbors = [P_sparse[i].indices for i in range(n)]
+    # - MODIFICATION: Pre-allocate a NumPy array for loss history.
+    #   Appending to a Python list inside a Numba loop is inefficient.
+    if log_loss:
+        loss_history = np.zeros(n_epochs, dtype=np.float32)
 
-    # Listas para armazenar o histórico das perdas
-    sampled_losses = []
-    effective_losses = []
+    # - MODIFICATION: Numba cannot use `tqdm` or `print`, so progress tracking is removed.
+    #   The loop will now run at maximum speed.
+    for epoch in range(n_epochs):
+        # The learning rate decays linearly over the epochs
+        current_alpha = alpha * (1.0 - epoch / float(n_epochs))
 
-    print("\nExecutando a descida do gradiente estocástica e calculando perdas: \n")
-    for epoch in tqdm(range(n_epochs), desc="Otimização SGD"):
-        # Loop de otimização SGD
-        for i in range(n):
-            # Amostras Positivas (força atrativa)
-            for j in neighbors[i]:
-                if i == j: continue
-                diff = y[i] - y[j]
-                dist2 = np.sum(diff**2)
-                grad_coeff = -2.0 * a * b * dist2**(b - 1) / (1 + a * dist2**b)
-                grad = grad_coeff * diff
-                y[i] -= lr * grad
-                y[j] += lr * grad
+        if log_loss:
+            attractive_loss = 0.0
+            repulsive_loss = 0.0
 
-            # Amostras Negativas (força repulsiva)
+        # - MODIFICATION: More efficient permutation within Numba
+        edge_indices = np.random.permutation(n_edges)
+
+        for i in range(n_edges):
+            edge_idx = edge_indices[i]
+            h_idx, t_idx = head[edge_idx], tail[edge_idx]
+            
+            y_h = y[h_idx]
+            y_t = y[t_idx]
+
+            dist_sq = np.sum(np.square(y_h - y_t))
+
+            # --- Attractive Force ---
+            # q_ij is the low-dimensional similarity
+            q_ij = 1.0 / (1.0 + a * (dist_sq ** b))
+            
+            if log_loss:
+                attractive_loss += np.log(q_ij + 1e-6)
+
+            # Gradient for attractive force
+            if dist_sq > 0.0:
+                grad_coeff = -2.0 * a * b * (dist_sq ** (b - 1.0))
+                grad_coeff /= (1.0 + a * (dist_sq ** b))
+            else:
+                grad_coeff = 0.0
+            
+            grad = grad_coeff * (y_h - y_t)
+            
+            # - MODIFICATION: Apply gradient clipping for stability, a standard UMAP practice.
+            grad = np.clip(grad, -4.0, 4.0)
+            
+            y[h_idx] += grad * current_alpha
+            y[t_idx] -= grad * current_alpha
+
+            # --- Repulsive Force ---
             for _ in range(n_neg_samples):
-                j = np.random.randint(0, n)
-                if j in neighbors[i] or i == j:
+                neg_idx = np.random.randint(0, n)
+                if neg_idx == h_idx:
                     continue
-                diff = y[i] - y[j]
-                dist2 = np.sum(diff**2)
-                grad_coeff = 2.0 * a * b * dist2**(b - 1) / (1 + a * dist2**b - 1e-8)
-                grad = grad_coeff * diff
-                y[i] += lr * grad
-                y[j] -= lr * grad
 
-        # --- Cálculo das perdas da época atual ---
-        sampled_positives = [(i, j) for i in range(n) for j in neighbors[i]]
-        sampled_negatives = [(i, np.random.randint(0, n)) for i in range(n) for _ in range(n_neg_samples)]
+                y_neg = y[neg_idx]
+                dist_sq_neg = np.sum(np.square(y_h - y_neg))
+                
+                # q_ik is the low-dimensional similarity for a negative sample
+                q_ik = 1.0 / (1.0 + a * (dist_sq_neg ** b))
+                
+                if log_loss:
+                    repulsive_loss += np.log(1.0 - q_ik + 1e-6)
 
-        loss_sampled = calculate_sampled_loss(y, sampled_positives, sampled_negatives, a, b)
-        loss_effective = calculate_effective_loss(y, P_sparse, a, b, n_neg_samples)
+                # Gradient for repulsive force
+                if dist_sq_neg > 0.0:
+                    grad_coeff_neg = 2.0 * b
+                    grad_coeff_neg /= (0.001 + dist_sq_neg) * (1.0 + a * (dist_sq_neg ** b))
+                else:
+                    grad_coeff_neg = 0.0
+                
+                grad_neg = grad_coeff_neg * (y_h - y_neg)
+                
+                # - MODIFICATION: Also apply gradient clipping here.
+                grad_neg = np.clip(grad_neg, -4.0, 4.0)
+                
+                y[h_idx] += grad_neg * current_alpha
 
-        sampled_losses.append(loss_sampled)
-        effective_losses.append(loss_effective)
+        if log_loss:
+            total_loss = -(attractive_loss + repulsive_loss) / float(n_edges)
+            loss_history[epoch] = total_loss
 
-    # --- Plotagem da evolução da perda (dentro da função) ---
-    plt.figure(figsize=(10, 5))
-    plt.plot(sampled_losses, label='Perda Amostrada (Real)')
-    plt.plot(effective_losses, label='Perda Efetiva (Teórica)')
-    plt.xlabel('Época')
-    plt.ylabel('Valor da Perda')
-    plt.title(f'Evolução das Perdas no UMAP - {dataset_name}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    nome_arquivo = f'loss_evolution_{dataset_name}.png'
-    plt.savefig(nome_arquivo)
-    print(f"\nGráfico da evolução da perda salvo como '{nome_arquivo}'")
-    plt.close()
-
-    return y
-
-
-def fuzzy_simplicial_set(dados, n_neighbors, random_state, metric):
-    """
-    Constructs a fuzzy simplicial set for the given data.
-    """
-    n = dados.shape[0]
-
-    print("Construindo o grafo k-NN...")
-    knn = NearestNeighbors(n_neighbors=n_neighbors, metric=metric)
-    knn.fit(dados)
-    dist_knn, indices_knn = knn.kneighbors(dados)
-    dist_knn = np.square(dist_knn)
-
-    rho = np.array([dist_knn[i][1] if dist_knn.shape[1] > 1 else 0.0 for i in range(dist_knn.shape[0])])
-
-    sigma_array = []
-    prob = lil_matrix((n, n), dtype=np.float32)
-
-    print("Calculando similaridades no espaço de alta dimensão...")
-    for i in tqdm(range(n), desc="Busca binária do Sigma"):
-        dists_i = dist_knn[i]
-
-        func = lambda sigma: k(prob_high_dim(dists_i, rho[i], sigma))
-        binary_search_result = sigma_binary_search(func, n_neighbors)
-
-        row_probs = prob_high_dim(dists_i, rho[i], binary_search_result)
-
-        prob[i, indices_knn[i]] = row_probs
-
-        sigma_array.append(binary_search_result)
-
-    P = (prob + prob.T).tocsr() / 2
-
-    return P, sigma_array, rho
-
+    if log_loss:
+        return loss_history, y
+    else:
+        # - MODIFICATION: Return an empty array if not logging loss to maintain output consistency.
+        return np.array([0.0], dtype=np.float32), y
 
 def umap(dados, target, N_NEIGHBOR):
     """
@@ -346,26 +306,82 @@ def umap(dados, target, N_NEIGHBOR):
     print('************************************')
     print('UMAP com distância Euclidiana')
     print('************************************\n')
+    n = dados.shape[0]
     
-    P, _, _ = fuzzy_simplicial_set(dados, N_NEIGHBOR, 42, 'euclidean')
+    #### Constructing a local fuzzy simplicial set ####
 
-    ############################## SPECTRAL EMBEDDING ################################
-    a, b = find_ab_params()
+    # MODIFICADO: Usar NearestNeighbors para encontrar o grafo k-NN de forma eficiente.
+    # Isso evita a criação de uma matriz de distância n x n completa.
+    print("Construindo o grafo k-NN...")
+    knn = NearestNeighbors(n_neighbors=N_NEIGHBOR, metric='euclidean')
+    knn.fit(dados)
+    # dist_knn e indices_knn são matrizes (n, k)
+    dist_knn, indices_knn = knn.kneighbors(dados)
+    dist_knn = np.square(dist_knn) # UMAP usa distâncias quadráticas
 
-    print(f"Hiperparâmetros a = {a} and b = {b}")      
+    # MODIFICADO: Cálculo de rho de forma eficiente a partir das distâncias k-NN.
+    # rho é a distância para o vizinho mais próximo (diferente de si mesmo).
+    # Usamos [:, 1] pois o vizinho 0 é o próprio ponto com distância 0.
+    rho = np.array([dist_knn[i][1] if dist_knn.shape[1] > 1 else 0.0 for i in range(dist_knn.shape[0])])
+   
+    sigma_array = []
+    # MODIFICADO: Inicializa a matriz de probabilidade como uma matriz esparsa.
+    prob = lil_matrix((n, n), dtype=np.float32)
+    
+    print("Calculando similaridades no espaço de alta dimensão...")
+    for i in tqdm(range(n), desc="Busca binária do Sigma"):
+        # Extrai as distâncias e índices dos k-vizinhos para o ponto i
+        dists_i = dist_knn[i]
+        
+        # MODIFICADO: A função de probabilidade agora opera apenas nas k distâncias.
+        func = lambda sigma: k(prob_high_dim(dists_i, rho[i], sigma))
+        binary_search_result = sigma_binary_search(func, N_NEIGHBOR)
+        
+        row_probs = prob_high_dim(dists_i, rho[i], binary_search_result)
+        
+        # MODIFICADO: Preenche a matriz esparsa apenas para os vizinhos.
+        prob[i, indices_knn[i]] = row_probs
+        
+        sigma_array.append(binary_search_result)
+
+    print(f"Sigma médio = {np.mean(sigma_array)}")
+
+    P = (prob + prob.T).tocsr() / 2
+    
+    # - MODIFICATION: Extract head and tail from the sparse matrix *before* calling the optimizer.
+    P_coo = P.tocoo()
+    head = P_coo.row
+    tail = P_coo.col
+
+    a, b = find_ab_params(1, MIN_DIST)
+    print(f"Hiperparâmetros a = {a} and b = {b}")
+
     np.random.seed(12345)
     print("Inicializando com Laplacian Eigenmaps...")
     model = SpectralEmbedding(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)
     y_init = model.fit_transform(dados)
     
-    y_final = umap_sgd_optimization(P, y_init, N_EPOCHS, LEARNING_RATE, a, b, N_NEG_SAMPLES)
-        
-    print("Finished UMAP")
-    return ([], y_final)
+    print("Otimizando layout...")
+    # - MODIFICATION: Call the new, fast JIT-compiled function.
+    #   We now wrap the call with tqdm to get the progress bar back.
+    #   Note that the progress bar will now be per-epoch, not per-sample.
+    loss, y_final = umap_sgd_optimization(
+        y_init,
+        head,
+        tail,
+        N_EPOCHS,
+        LEARNING_RATE,
+        a,
+        b,
+        N_NEG_SAMPLES,
+        log_loss=True
+    )
+            
+    print("UMAP Finalizado.")
+    return (loss, y_final)
 
 
-
-def curvature_estimation(dados, k):
+def curvature_estimation(dados, k, method="gaussian"):
     """
     Computes the curvatures of all samples in the training set
     """
@@ -392,7 +408,6 @@ def curvature_estimation(dados, k):
     knnGraph = sknn.kneighbors_graph(dados, n_neighbors=k, mode='connectivity', include_self=False)
     A = knnGraph.toarray()
 
-    print("Computing shape operator for each point...")
     for i in tqdm(range(n), desc="Computing curvatures"):
         vizinhos = A[i, :]
         indices = vizinhos.nonzero()[0]
@@ -423,21 +438,69 @@ def curvature_estimation(dados, k):
 
         # Shape Operator
         S = -np.dot(II, I)
+        #S += np.eye(m)/1e-6
 
-        curvatures[i] = abs(np.linalg.det(S))
+        if method == "gaussian":
+            curvatures[i] = abs(np.linalg.det(S))
+        elif method == "mean":
+            curvatures[i] = np.linalg.trace(S)
 
     return curvatures
 
+def calculate_entropy(data, n_bins):
+    if n_bins >= len(data):
+        return 0
+
+    # Use fixed-width bins across the data range
+    bins = np.linspace(np.min(data), np.max(data), n_bins + 1)
+    counts, _ = np.histogram(data, bins=bins)
+
+    # Normalize to get probabilities
+    probs = counts / np.sum(counts)
+    probs = probs[probs > 0]  # Avoid log(0)
+
+    # Calculate Shannon entropy
+    entropy = -np.sum(probs * np.log2(probs))
+    return entropy
 
 def normalize_curvatures(curv):
     """
-    Function to normalize the curvatures to the interval [0, 1]
+    Normalize curvature values to [0, 1]
     """
     if curv.min() != curv.max():
-        k = (curv - curv.min())/(curv.max() - curv.min())
+        return (curv - curv.min()) / (curv.max() - curv.min())
     else:
-        k = curv/len(curv)
-    return k
+        return curv / len(curv)
+
+def percentile_rank(K, n_neighbors):
+    """
+    Assign ranks to K based on adaptive binning guided by entropy.
+    """
+    entropies = []
+    bin_range = range(3, min(n_neighbors - 1, len(K) // 2))
+
+    for n_bins in bin_range:
+        entropy = calculate_entropy(K, n_bins)
+        entropies.append(entropy)
+
+    if not entropies:
+        n_bins = 5
+    else:
+        entropies = np.array(entropies)
+        if len(entropies) > 2:
+            # Use the elbow in the entropy curve
+            second_deriv = np.diff(entropies, n=2)
+            elbow_idx = np.argmax(second_deriv) + 1 if len(second_deriv) > 0 else 0
+            n_bins = list(bin_range)[elbow_idx]
+        else:
+            n_bins = list(bin_range)[np.argmax(entropies)]
+
+    # Use fixed-width bins instead of quantile bins
+    bins = np.linspace(np.min(K), np.max(K), n_bins)
+    ranks = np.digitize(K, bins, right=False)
+
+    return ranks
+    
 
 def k_umap(dados, target, N_NEIGHBOR):
     """
@@ -447,61 +510,96 @@ def k_umap(dados, target, N_NEIGHBOR):
     print('UMAP com curvatura local via operador de forma')
     print('*************************************************\n')
     n = dados.shape[0]
-    MIN_NEIGH = 3
+    c = np.unique(target)
     
     print("Calculando curvaturas locais...")
-    curvaturas = curvature_estimation(dados, N_NEIGHBOR)
-    K = normalize_curvatures(curvaturas)
-    
-    intervalos = np.linspace(min(K), max(K), N_NEIGHBOR-MIN_NEIGH)
-    quantis = np.quantile(K, intervalos)
-    bins = np.array(quantis)
-    K = np.digitize(K, bins)
-    
-    # Fuzzy simplicial set
-    # MODIFICADO: A lógica de construção de P é a mesma do umap, 
-    # Exceto na busca binária por sigma que a vizinhança varia com a curvatura.
-    print("Construindo o grafo k-NN...")
+
+
     knn = NearestNeighbors(n_neighbors=N_NEIGHBOR, metric='euclidean')
     knn.fit(dados)
     dist_knn, indices_knn = knn.kneighbors(dados)
     dist_knn = np.square(dist_knn)
 
     rho = np.array([dist_knn[i][1] if dist_knn.shape[1] > 1 else 0.0 for i in range(dist_knn.shape[0])])
+
+    curvatures = curvature_estimation(dados, N_NEIGHBOR,"mean")
+
+    K = percentile_rank(curvatures,N_NEIGHBOR)
+
+    unique_values, counts = np.unique(K, return_counts=True)
+
+    # Or combine them for better readability
+    print("Ranking de curvatura (Rank: Quantidade)")
+    for value, count in zip(unique_values, counts):
+        print(f"{value}: {count}")
+
+    #print("Dist: ", dist_knn[0])
+    #print("Index: ", indices_knn[0])
+
+    #for i in range(n):
+        # Ensure we don't try to disconnect more neighbors than exist
+        #if K[i] < N_NEIGHBOR and K[i] > 0:
+        #    # Get the start slice index for disconnection
+        #    new_k = N_NEIGHBOR - K[i]
+        #
+        #    dist_knn[i] = dist_knn[i,:N_NEIGHBOR - K[i]]
+        #    indices_knn[i] = indices_knn[i,:N_NEIGHBOR - K[i]]
+
+    #print("Dist after: ", dist_knn[0,:N_NEIGHBOR - K[0]])
+    #print("Index after: ", indices_knn[0,:N_NEIGHBOR - K[0]])
+
+    # Fuzzy simplicial set
+    print("Construindo o grafo k-NN...")
     
     prob = lil_matrix((n, n), dtype=np.float32)
     sigma_array = []
     
     print("Calculando similaridades no espaço de alta dimensão...")
     for i in tqdm(range(n), desc="Busca binária do Sigma (com curvatura)"):
-        dists_i = dist_knn[i]
+        dists_i = dist_knn[i,:N_NEIGHBOR - K[i]]
         
         func = lambda sigma: k(prob_high_dim(dists_i, rho[i], sigma))
         # A curvatura ajusta o número de vizinhos alvo na busca binária.
         target_k = max(2, N_NEIGHBOR - K[i])
         binary_search_result = sigma_binary_search(func, target_k)
 
-        prob[i, indices_knn[i]] = prob_high_dim(dists_i, rho[i], binary_search_result)
+        prob[i, indices_knn[i,:N_NEIGHBOR - K[i]]] = prob_high_dim(dists_i, rho[i], binary_search_result)
         sigma_array.append(binary_search_result)
 
-    print(f"\nSigma médio = {np.mean(sigma_array)}\n")
+    print(f"Sigma médio = {np.mean(sigma_array)}")
     
-    P = (prob + prob.T).tocsr() / 2         
+    P = (prob + prob.T).tocsr() / 2
+    
+    # - MODIFICATION: Extract head and tail from the sparse matrix *before* calling the optimizer.
+    P_coo = P.tocoo()
+    head = P_coo.row
+    tail = P_coo.col
 
-    ############################## SPECTRAL EMBEDDING ################################
-    a, b = find_ab_params()
+    a, b = find_ab_params(1, MIN_DIST)
+    print(f"Hiperparâmetros a = {a} and b = {b}")
 
-    print(f"Hiperparâmetros a = {a} and b = {b}")    
     np.random.seed(12345)
     print("Inicializando com Laplacian Eigenmaps...")
     model = SpectralEmbedding(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)
     y_init = model.fit_transform(dados)
     
-    loss = []
-
-    y_final = umap_sgd_optimization(P,y_init,100,1,a,b,5)
+    print("Otimizando layout...")
+    # - MODIFICATION: Call the new, fast JIT-compiled function.
+    #   We now wrap the call with tqdm to get the progress bar back.
+    #   Note that the progress bar will now be per-epoch, not per-sample.
+    loss, y_final = umap_sgd_optimization(
+        y_init,
+        head,
+        tail,
+        N_EPOCHS,
+        LEARNING_RATE,
+        a,
+        b,
+        N_NEG_SAMPLES,
+        log_loss=True
+    )
             
-    print("Finished UMAP")
+    print("Finished SH-UMAP")
     return (loss, y_final)
 
 
@@ -536,86 +634,119 @@ def PlotaDados(dados, labels, metodo, dataset_name):
 
 def EvaluationMetrics(dados, target, method, N_NEIGHBOR):
     """
-    Computes performance evaluation metrics
+    Computes performance evaluation metrics.
+    Uses GMM for clustering and provides KNN classification scores
+    with 10-fold cross-validation, including standard deviation.
     """
-    print()
-    print('Quantitative metrics for %s features' %(method))
-    print()
-    
-    lista = []
-    lista_p = []
-    lista_r = []
-    lista_f1 = []
-    lista_j = []
-    lista_k = []
-    
-    classifiers = {
-        'KNN': KNeighborsClassifier(n_neighbors=N_NEIGHBOR),
-        'SVM': SVC(gamma='auto', probability=True),
-        'GaussianNB': GaussianNB(),
-        'DecisionTree': DecisionTreeClassifier(random_state=42),
-        'RandomForest': RandomForestClassifier(random_state=42)
-    }
-    
-    X_train, X_test, y_train, y_test = train_test_split(dados.real, target, test_size=0.5, random_state=42, stratify=target)
-    
-    for name, clf in classifiers.items():
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
-        
-        # Ignorar avisos de métricas para classes não previstas
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            lista.append(metrics.balanced_accuracy_score(y_test, y_pred))
-            lista_k.append(metrics.cohen_kappa_score(y_test, y_pred))
-            lista_p.append(metrics.precision_score(y_test, y_pred, average='weighted'))
-            lista_r.append(metrics.recall_score(y_test, y_pred, average='weighted'))
-            lista_f1.append(metrics.f1_score(y_test, y_pred, average='weighted'))
-            lista_j.append(metrics.jaccard_score(y_test, y_pred, average='weighted'))
+    print(f'\nQuantitative metrics for {method} features\n')
 
-    # Clustering metrics
-    c = len(np.unique(target))
-    labels_ = KMeans(n_clusters=c, random_state=42, n_init=10).fit_predict(dados.real)
+    # Ensure dados.real is a DataFrame for consistent indexing with KFold
+    if isinstance(dados, pd.Series):
+        X = dados.to_frame()
+    elif isinstance(dados, pd.DataFrame):
+        X = dados
+    else: # Assuming it's an object with a 'real' attribute that is array-like
+        X = pd.DataFrame(dados.real)
+
+    y = target
+
+    # --- Clustering Metrics (using GMM) ---
+    c = len(np.unique(y))
     
-    sc = metrics.silhouette_score(dados.real, target, metric='euclidean')
-    ch = metrics.calinski_harabasz_score(dados.real, target)
-    db = metrics.davies_bouldin_score(dados.real, target)
-    fm = metrics.fowlkes_mallows_score(labels_, target)
-    ri = metrics.rand_score(labels_, target)
-    mi = metrics.mutual_info_score(labels_, target)
-    vm = metrics.v_measure_score(labels_, target)
+    gmm = GaussianMixture(n_components=c, random_state=42, n_init=10)
+    gmm_labels = gmm.fit_predict(X)
+
+    sc = metrics.silhouette_score(X, y, metric='euclidean')
+    ch = metrics.calinski_harabasz_score(X, y)
+    db = metrics.davies_bouldin_score(X, y)
     
-    acc = max(lista) if lista else 0
-    precision = max(lista_p) if lista_p else 0
-    recall = max(lista_r) if lista_r else 0
-    f1 = max(lista_f1) if lista_f1 else 0
-    jac = max(lista_j) if lista_j else 0
-    kap = max(lista_k) if lista_k else 0
+    ri = metrics.rand_score(gmm_labels, y)
+    fm = metrics.fowlkes_mallows_score(gmm_labels, y)
+    mi = metrics.mutual_info_score(gmm_labels, y)
+    vm = metrics.v_measure_score(gmm_labels, y)
 
     print(f'Silhouette coefficient: {sc:.4f}')
     print(f'Calinski Harabasz: {ch:.4f}')
     print(f'Davies Bouldin: {db:.4f}')
-    print(f'Rand index: {ri:.4f}')
-    print(f'Fowlkes Mallows score: {fm:.4f}')
-    print(f'Mutual info score: {mi:.4f}')
-    print(f'V-measure score: {vm:.4f}')
-    print('-----------------------------------')
-    print(f'Maximum balanced accuracy: {acc:.4f}')
-    print(f'Maximum kappa: {kap:.4f}')
-    print(f'Maximum precision: {precision:.4f}')
-    print(f'Maximum recall: {recall:.4f}')
-    print(f'Maximum F1 weighted: {f1:.4f}')
-    print(f'Maximum Jaccard: {jac:.4f}')
-    print()
+    print(f'Rand index (GMM): {ri:.4f}')
+    print(f'Fowlkes Mallows score (GMM): {fm:.4f}')
+    print(f'Mutual info score (GMM): {mi:.4f}')
+    print(f'V-measure score (GMM): {vm:.4f}')
+    print('-----------------------------------\n')
+
+    clustering_results = {
+        'Silhouette': float(sc),
+        'Calinski_Harabasz': float(ch),
+        'Davies_Bouldin': float(db),
+        'Rand_index': float(ri),
+        'Fowlkes_Mallows': float(fm),
+        'Mutual_info': float(mi),
+        'V_measure': float(vm)
+    }
+
+    # --- Classification Metrics (KNN with 10-fold Cross-Validation) ---
+    print(f'Evaluating KNN with 10-fold Cross-Validation...')
+    clf = KNeighborsClassifier(n_neighbors=N_NEIGHBOR)
+    kf = KFold(n_splits=10, shuffle=True, random_state=42)
+
+    balanced_accuracy_scores = []
+    kappa_scores = []
+    precision_scores = []
+    recall_scores = []
+    f1_scores = []
+    jaccard_scores = []
+
+    for train_index, test_index in kf.split(X):
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index] if isinstance(y, pd.Series) else y[train_index], \
+                          y.iloc[test_index] if isinstance(y, pd.Series) else y[test_index]
+        
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            balanced_accuracy_scores.append(metrics.balanced_accuracy_score(y_test, y_pred))
+            kappa_scores.append(metrics.cohen_kappa_score(y_test, y_pred))
+            precision_scores.append(metrics.precision_score(y_test, y_pred, average='weighted', zero_division=0))
+            recall_scores.append(metrics.recall_score(y_test, y_pred, average='weighted', zero_division=0))
+            f1_scores.append(metrics.f1_score(y_test, y_pred, average='weighted', zero_division=0))
+            jaccard_scores.append(metrics.jaccard_score(y_test, y_pred, average='weighted', zero_division=0))
     
-    return [sc, ch, db, ri, fm, mi, vm, acc, kap, precision, recall, f1, jac]
+    # Calculate means and standard deviations
+    knn_classification_results = {
+        'Balanced_Accuracy_mean': float(np.mean(balanced_accuracy_scores)),
+        'Balanced_Accuracy_std': float(np.std(balanced_accuracy_scores)),
+        'Kappa_mean': float(np.mean(kappa_scores)),
+        'Kappa_std': float(np.std(kappa_scores)),
+        'Precision_weighted_mean': float(np.mean(precision_scores)),
+        'Precision_weighted_std': float(np.std(precision_scores)),
+        'Recall_weighted_mean': float(np.mean(recall_scores)),
+        'Recall_weighted_std': float(np.std(recall_scores)),
+        'F1_weighted_mean': float(np.mean(f1_scores)),
+        'F1_weighted_std': float(np.std(f1_scores)),
+        'Jaccard_weighted_mean': float(np.mean(jaccard_scores)),
+        'Jaccard_weighted_std': float(np.std(jaccard_scores))
+    }
+    
+    print(f"  Avg. Balanced Accuracy: {knn_classification_results['Balanced_Accuracy_mean']:.4f} (+/- {knn_classification_results['Balanced_Accuracy_std']:.4f})")
+    print(f"  Avg. Kappa: {knn_classification_results['Kappa_mean']:.4f} (+/- {knn_classification_results['Kappa_std']:.4f})")
+    print(f"  Avg. Precision: {knn_classification_results['Precision_weighted_mean']:.4f} (+/- {knn_classification_results['Precision_weighted_std']:.4f})")
+    print(f"  Avg. Recall: {knn_classification_results['Recall_weighted_mean']:.4f} (+/- {knn_classification_results['Recall_weighted_std']:.4f})")
+    print(f"  Avg. F1: {knn_classification_results['F1_weighted_mean']:.4f} (+/- {knn_classification_results['F1_weighted_std']:.4f})")
+    print(f"  Avg. Jaccard: {knn_classification_results['Jaccard_weighted_mean']:.4f} (+/- {knn_classification_results['Jaccard_weighted_std']:.4f})")
+    print()
+
+    merged_results = clustering_results | knn_classification_results
+
+    return merged_results
 
         
 def main():
     warnings.simplefilter(action='ignore')
 
-    # X = skdata.load_iris()     # 15 - all
-    X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
+    #X = skdata.load_iris()     # 15 - all
+    #X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
     #X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
@@ -634,8 +765,8 @@ def main():
     #X = skdata.fetch_openml(name='semeion', version=1)          # sqrt - all
     #X = skdata.fetch_openml(name='micro-mass', version=1)       # sqrt - all
     #X = skdata.fetch_openml(name='MNIST_784', version=1)        # sqrt - all
-    # X = skdata.fetch_openml(name='pendigits', version=1)        # sqrt - all
-    # X = skdata.fetch_openml(name='satimage', version=1)         # sqrt - all
+    X = skdata.fetch_openml(name='pendigits', version=1)        # sqrt - all
+    #X = skdata.fetch_openml(name='satimage', version=1)         # sqrt - all
     #X = skdata.fetch_openml(name='dilbert', version=1)          # sqrt - all - 20%
     #X = skdata.fetch_openml(name='gina_agnostic', version=1)    # sqrt - all
     #X = skdata.fetch_openml(name='vowel', version=1)            # sqrt - all
@@ -677,7 +808,7 @@ def main():
     le = LabelEncoder()
     target = le.fit_transform(target)
 
-    if dados.shape[0] > 5000:
+    if dados.shape[0] > 60000:
         print(f"Dataset grande. Reduzindo de {dados.shape[0]} para 5000 amostras.")
         dados, _, target, _ = train_test_split(dados, target, train_size=5000, random_state=42, stratify=target)
     
@@ -687,8 +818,9 @@ def main():
     n, m = dados.shape
     c = len(np.unique(target))
 
+    #N_NEIGHBOR = int(np.round(np.log2(n)))
     N_NEIGHBOR = int(np.round(np.sqrt(n)))
-
+    print(f'Datasetname = {dataset_name}')
     print(f'N = {n}')
     print(f'M = {m}')
     print(f'C = {c}')
@@ -697,15 +829,15 @@ def main():
     erro_umap, dados_umap = umap(dados, target, N_NEIGHBOR)
     PlotaDados(dados_umap, target, 'UMAP', dataset_name)
     
-    print('\nK-UMAP')
+    print('\nSH-UMAP')
     print('------------------------------------')
     erro_k_umap, dados_k_umap = k_umap(dados, target, N_NEIGHBOR)
-    PlotaDados(dados_k_umap, target, 'K-UMAP', dataset_name)
+    PlotaDados(dados_k_umap, target, 'SH-UMAP', dataset_name)
 
     plt.figure()
     START=8
     plt.plot(erro_umap[START:], c='red', label='UMAP (Euclidean)', alpha=0.7)
-    plt.plot(erro_k_umap[START:], c='blue', label='K-UMAP', alpha=0.7)
+    plt.plot(erro_k_umap[START:], c='blue', label='SH-UMAP', alpha=0.7)
     plt.title("Convergência da Entropia Cruzada", fontsize=12)
     plt.xlabel("Iteração", fontsize=12)
     plt.ylabel("Entropia Cruzada", fontsize=12)
@@ -719,15 +851,16 @@ def main():
     umap_metrics = EvaluationMetrics(dados_umap, target, 'UMAP (Euclidean)', N_NEIGHBOR)
     k_umap_metrics = EvaluationMetrics(dados_k_umap, target, 'SH-UMAP', N_NEIGHBOR)
 
+
     new_result = {
-        dataset_name: {
-            'UMAP (Euclidean)': {metric: val for metric, val in zip(['Silhouette', 'Calinski_Harabasz', 'Davies_Bouldin', 'Rand_index', 'Fowlkes_Mallows', 'Mutual_info', 'V_measure', 'Max_balanced_accuracy', 'Max_kappa', 'Max_precision', 'Max_recall', 'Max_F1_weighted', 'Max_Jaccard'], umap_metrics)},
-            'K-UMAP': {metric: val for metric, val in zip(['Silhouette', 'Calinski_Harabasz', 'Davies_Bouldin', 'Rand_index', 'Fowlkes_Mallows', 'Mutual_info', 'V_measure', 'Max_balanced_accuracy', 'Max_kappa', 'Max_precision', 'Max_recall', 'Max_F1_weighted', 'Max_Jaccard'], k_umap_metrics)}
-        }
+    dataset_name: {
+        'UMAP (Euclidean)': dict(umap_metrics),
+        'SH-UMAP': dict(k_umap_metrics)
+    }
     }
     
-    if os.path.exists('resultados_umap.json'):
-        with open('resultados_umap.json', 'r', encoding='utf-8') as f:
+    if os.path.exists('novos_resultados_shumap.json'):
+        with open('novos_resultados_shumap.json', 'r', encoding='utf-8') as f:
             try:
                 results = json.load(f)
             except json.JSONDecodeError:
@@ -735,7 +868,7 @@ def main():
         results.update(new_result)
     else:
         results = new_result
-    with open('resultados_umap.json', 'w', encoding='utf-8') as f:
+    with open('novos_resultados_shumap.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
 
 if __name__ == '__main__':

@@ -252,8 +252,8 @@ def umap(dados, target, N_NEIGHBOR):
     
     #### Constructing a local fuzzy simplicial set ####
 
-    # MODIFICADO: 
-    # Usar knn para encontrar o grafo 
+    # MODIFICADO
+    # Usa knn para encontrar as distâncias
     # Isso evita a criação de uma matriz de distância n x n completa.
     print("Construindo o grafo k-NN...")
     knn = NearestNeighbors(n_neighbors=N_NEIGHBOR, metric='euclidean')
@@ -261,7 +261,7 @@ def umap(dados, target, N_NEIGHBOR):
 
     # dist_knn e indices_knn são matrizes (n, k)
     dist_knn, indices_knn = knn.kneighbors(dados)
-    dist_knn = np.square(dist_knn) # UMAP utiliza distâncias quadráticas
+    dist_knn = np.square(dist_knn)
 
     rho = np.array([dist_knn[i][1] if dist_knn.shape[1] > 1 else 0.0 for i in range(dist_knn.shape[0])])
    

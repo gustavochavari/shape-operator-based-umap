@@ -133,52 +133,6 @@ def find_ab_params(spread=1.0, min_dist=0.1):
     (a, b), _ = curve_fit(func, x, y)
     return a, b
 
-############ DEPRECADO 
-#
-# def CE(P, Y, a, b, distance='euclidean'):
-#    """
-#    Computa a Entropia Cruzada (CE) entre a matriz de probabilidades no espaço
-#    de alta dimensionalidade e as e as coordenadas do espaço de baixa dimensão
-#    """
-#    Q = prob_low_dim(Y, a, b, distance)
-#
-#    return - P * np.log(Q + 0.001) - (1 - P) * np.log(1 - Q + 0.001)
-#
-#
-# def CE_gradient(P, Y, a, b, distance='euclidean'):
-#     """
-#     Computa o  gradiente da Entropia Cruzada (CE)
-#     """
-#     y_diff = np.expand_dims(Y, 1) - np.expand_dims(Y, 0)
-#     if distance == 'mahalanobis':
-#         m = Y.shape[1]
-#         sigma = np.cov(Y.T)
-#         # Se necessário, regulariza matriz de convariâncias
-#         if cond(sigma) > 1/sys.float_info.epsilon:
-#             sigma += np.diag(0.0001*np.ones(m))
-#         inv_sigma = inv(sigma)
-#         distances = cdist(Y, Y, 'mahalanobis', VI=sigma)
-#     else:
-#         distances = euclidean_distances(Y, Y)
-#         
-#     inv_dist = np.power(1 + a * np.square(distances)**b, -1)
-# 
-#     # MODIFICADO: A formula original de Q parecia ser um erro de digitação (np.dot).
-#     # Assumindo uma multiplicação ponto a ponto para o cálculo do gradiente no estilo t-SNE.
-#     # Esta parte do gradiente ainda é computacionalmente lenta: O(n^2).
-#     # A otimização com amostragem negativa seria o próximo passo para melhorar a performance aqui,
-#     Q_repulsive = (1 - P) * np.power(0.001 + np.square(distances), -1)
-# 
-#     np.fill_diagonal(Q_repulsive, 0)
-# 
-#     Q = Q_repulsive / np.sum(Q_repulsive, axis = 1, keepdims = True)
-#     
-#     fact = np.expand_dims(a * P * (1e-8 + np.square(distances))**(b-1) - Q, 2)
-# 
-#     gradient = 2 * b * np.sum(fact * y_diff * np.expand_dims(inv_dist, 2), axis = 1)
-# 
-#     return gradient
-
 # MODIFICADO
 # A função abaixo implementa a otimização via SGD
 # Também utiliza a otimização via NUMBA

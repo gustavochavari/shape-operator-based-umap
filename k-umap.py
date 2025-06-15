@@ -3,6 +3,8 @@
     de métricas baseado na curvatura local
 
     Protótipo em Python do método a ser desenvolvido
+
+    Modificado por Gustavo H. Chavari
 '''
 
 import os
@@ -22,6 +24,7 @@ from numpy.linalg import inv
 from numpy.linalg import cond
 from scipy.spatial.distance import cdist
 from sklearn.decomposition import PCA
+from sklearn.model_selection import KFold
 from sklearn.manifold import SpectralEmbedding
 from sklearn.manifold import Isomap
 from sklearn.manifold import LocallyLinearEmbedding as LLE  
@@ -62,22 +65,22 @@ MAX_ITER = 120
 # FUNÇÕES AUXILIARES
 #####################################################
 
-def prob_high_dim(dist,rho,sigma,dist_row):
+def prob_high_dim(dist, rho, sigma, dist_row):
     """
      Para cada linha da matriz de distâncias computa as probabilidades no espaço de alta dimensão
      (1D array)
     """
     d = dist[dist_row] - rho[dist_row]
-    d = np.maximum(d, 0)
-
+    d[d < 0] = 0
     return np.exp(- d / sigma)
 
 
 def k(prob):
     """
-    Computa n_neighbor = k (smooth) para cada array de probabilidades de alta dimensionalidade
+    Computa n_neighbor = k (escalar) para cada array de probabilidades de alta dimensionalidade
     """
     return np.power(2, np.sum(prob))
+
 
 def sigma_binary_search(k_of_sigma, fixed_k):
     """
@@ -86,7 +89,7 @@ def sigma_binary_search(k_of_sigma, fixed_k):
     """
     sigma_lower_limit = 0
     sigma_upper_limit = 1000
-    for i in range(64):
+    for i in range(20):
         approx_sigma = (sigma_lower_limit + sigma_upper_limit) / 2
         if k_of_sigma(approx_sigma) < fixed_k:
             sigma_lower_limit = approx_sigma
@@ -95,6 +98,20 @@ def sigma_binary_search(k_of_sigma, fixed_k):
         if np.abs(fixed_k - k_of_sigma(approx_sigma)) <= 1e-5:
             break
     return approx_sigma
+
+
+def f(x, min_dist):
+    """
+    Função auxiliar para calcular hiperparâmetros
+    """
+    y = []
+    for i in range(len(x)):
+        if x[i] <= min_dist:
+            y.append(1)
+        else:
+            y.append(np.exp(- x[i] + min_dist))
+    return y
+
 
 def prob_low_dim(Y, a, b, distance='euclidean'):
     """
@@ -161,7 +178,7 @@ def find_ab_params(spread=1.0, min_dist=0.1):
     return a, b
 
 
-def umap(dados, target, N_NEIGHBOR):
+def umap(dados,target,N_NEIGHBOR):
     """
     Implementa o algoritmo UMAP padrão
     """
@@ -170,74 +187,46 @@ def umap(dados, target, N_NEIGHBOR):
     print('************************************\n')
     n = dados.shape[0]
     m = dados.shape[1]
-    c = len(np.unique(target))
-
-    #### Constructing a local fuzzy simplicial set ####
-
-    # Create kNN graph for optimized memory usage
-    #knn = NearestNeighbors(n_neighbors=N_NEIGHBOR+1, metric='euclidean')
-    #knn.fit(dados)
-    #dist, indices = knn.kneighbors(dados)
-    
-    dist = np.square(euclidean_distances(dados,dados))
-
-    # The local connectivity adjustment using kNN distances
-    rho = np.array([sorted(dist[i])[0] for i in range(dist.shape[0])])
-   
-    sigma_array = []
+    c = len(np.unique(target))  
+    # Calcula as distâncias euclidianas ponto a ponto
+    dist = np.square(euclidean_distances(dados, dados))
+    rho = [sorted(dist[i])[1] for i in range(dist.shape[0])]
+    # Computa a matriz no espaço de alta dimensionalidade   
     prob = np.zeros((n,n))
-    
+    sigma_array = []
     for dist_row in range(n):
-        # Use kNN-aware prob_high_dim
         func = lambda sigma: k(prob_high_dim(dist, rho, sigma, dist_row))
         binary_search_result = sigma_binary_search(func, N_NEIGHBOR)
-        
-        row_probs = prob_high_dim(dist, rho, binary_search_result, dist_row)
-
-        prob[dist_row] = row_probs
-        
+        prob[dist_row] = prob_high_dim(dist, rho, binary_search_result, dist_row)
         sigma_array.append(binary_search_result)
-        
         if (dist_row + 1) % 500 == 0:
             print("Busca binária do Sigma terminada em {0} de {1} amostras".format(dist_row + 1, n))
     print("\nSigma = " + str(np.mean(sigma_array)))
-
+    print()
     # Duas formas de calcular a matriz de probabilidades
-    # P = prob + np.transpose(prob) - np.multiply(prob, np.transpose(prob)) (igual ao do artigo)
-
-    # Igual ao t-SNE (melhor)
-    P = (prob + np.transpose(prob)) / 2         
-
-    ############################## SPECTRAL EMBEDDING ################################
+    #P = prob + np.transpose(prob) - np.multiply(prob, np.transpose(prob))
+    P = (prob + np.transpose(prob)) / 2        # Igual ao t-SNE (melhor)    
     # Hiperparâmetros
-    #a = 1.93
-    #b = 0.79
-
-    a, b = find_ab_params(1,MIN_DIST)
-
-
-
+    a = 1.93
+    b = 0.79
     print("Hiperparâmetros a = " + str(a) + " and b = " + str(b))    
     # Semente para os números aleatórios
     np.random.seed(12345)
     # Laplacian Eigenmaps para inicialização das coordenadas dos pontos no espaço de baixa dimensão
-    print("Laplacian Eigenmaps")
     model = SpectralEmbedding(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)
     #model = LLE(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)
     #model = Isomap(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)
     y = model.fit_transform(dados)
-    #y = model.affinity_matrix_.toarray()
     # Inicia a minimização da função de perda
     CE_array = []
     print("\nExecutando a descida do gradiente: \n")
-
     for i in range(MAX_ITER):
         y = y - LEARNING_RATE * CE_gradient(P, y, a, b)
         CE_current = np.sum(CE(P, y, a, b)) / 1e+5  # Constante apenas para normalizar os valores
         CE_array.append(CE_current)
         if i % 10 == 0:
             print("Cross-Entropy = " + str(CE_current) + " depois de " + str(i) + " iterações")
-    print("Finished UMAP")
+    print()
     return (CE_array, y)
 
 
@@ -268,8 +257,7 @@ def curvature_estimation(dados, k,method="gaussian"):
     knnGraph = sknn.kneighbors_graph(dados, n_neighbors=k, mode='connectivity', include_self=False)
     A = knnGraph.toarray()
 
-    # Computes the means and covariance matrices for each patch
-    # Add progress bar
+
     print("Computing shape operator for each point...")
     for i in tqdm(range(n), desc="Computing curvatures"):
         ######## Patch P_i
@@ -286,11 +274,10 @@ def curvature_estimation(dados, k,method="gaussian"):
             #I = I + 0.0001*np.eye(I.shape[0])   # Regulariza
         else:
             I = np.eye(m)      # pontos isolados = identidade
-        # Compute the eigenvectors
+
         v, w = np.linalg.eig(I)
-        # Sort the eigenvalues
         ordem = v.argsort()
-        # Select the eigenvectors in decreasing order (in columns)
+    
         Wpca = w[:, ordem[::-1]]
         # Estima segunda forma fundamental
         for j in range(0, m):
@@ -309,47 +296,96 @@ def curvature_estimation(dados, k,method="gaussian"):
         Q = Wpca
         # Discard the first m columns of H
         H = Q[:, (m+1):]
+
         # Segunda forma fundamental
         II = np.dot(H, H.T)
         S = -np.dot(II, I)
         
         if method == "gaussian":
-            curvatures[i] = abs(np.linalg.det(S))        # curvatura Gaussiana
+            curvatures[i] = abs(np.linalg.det(S+np.eye(m)/1e-3))        # curvatura Gaussiana
         else:   
-           curvatures[i] = np.trace(S)            # curvatura média
+           curvatures[i] = np.trace(S)         
     return curvatures
 
 
+def calculate_entropy(data, n_bins):
+    if n_bins >= len(data):
+        return 0
+
+    bins = np.linspace(np.min(data), np.max(data), n_bins + 1)
+    counts, _ = np.histogram(data, bins=bins)
+
+    probs = counts / np.sum(counts)
+    probs = probs[probs > 0]  
+
+    # Shannon entropy
+    entropy = -np.sum(probs * np.log2(probs))
+    return entropy
+
+# Não é mais utilizado
 def normalize_curvatures(curv):
     """
-    Optional function to normalize the curvatures to the interval [0, 1]
+    Normalize curvature values to [0, 1]
     """
     if curv.min() != curv.max():
-        k = (curv - curv.min())/(curv.max() - curv.min())
+        return (curv - curv.min()) / (curv.max() - curv.min())
     else:
-        k = curv/len(curv)
-    return k
+        return curv / len(curv)
 
-def curvature_based_graph(dados, k, curv):
-    n = dados.shape[0]
+def percentile_rank(K, n_neighbors,dataset_name,plot=True):
+    """
+    Assign ranks to K based on adaptive binning guided by entropy.
+    """
+    entropies = []
+    bin_range = range(3, n_neighbors - 1)
 
-    # Generate KNN graph with distances
-    knnGraph_sparse = kneighbors_graph(dados, n_neighbors=k, mode='distance', include_self=False)
-    A = knnGraph_sparse.toarray() # Convert to a dense array for easier manipulation
+    for n_bins in bin_range:
+        entropy = calculate_entropy(K, n_bins)
+        entropies.append(entropy)
 
-    # Get the indices of the k-nearest neighbors for each point
-    neighs = np.argsort(A, axis=1)[:, 1:k+1] # Skip the first column if it's 0 (no self-loops)
+    if not entropies:
+        n_bins = 5
+    else:
+        entropies = np.array(entropies)
+        if len(entropies) > 2:
+            # Encontra o cotovelo
+            second_deriv = np.diff(entropies, n=2)
+            elbow_idx = np.argmax(second_deriv) + 1 if len(second_deriv) > 0 else 0
+            n_bins = list(bin_range)[elbow_idx]
+        else:
+            n_bins = list(bin_range)[np.argmax(entropies)]
 
-    # Disconnect farthest samples
-    for i in range(n):
-        less = curv[i]
-        if less > 0 and less <= k: 
-            farthest_neighbors_to_disconnect_indices = neighs[i, k - less:k]
-            A[i, farthest_neighbors_to_disconnect_indices] = 0
-            
-    return A
+    bins = np.linspace(np.min(K), np.max(K), n_bins)
+    ranks = np.digitize(K, bins, right=False)
 
-def k_umap(dados, target, N_NEIGHBOR):
+    if plot:
+        plt.figure(figsize=(12, 5))
+        
+        # Entropia vs n_bins
+        plt.subplot(1, 2, 1)
+        plt.plot(bin_range, entropies, 'bo-')
+        plt.axvline(x=n_bins, color='r', linestyle='--', label=f'Selected n_bins = {n_bins}')
+        plt.xlabel('Number of bins')
+        plt.ylabel('Entropy')
+        plt.title('Entropy vs Number of Bins')
+        plt.legend()
+        
+        # Histograma
+        plt.subplot(1, 2, 2)
+        unique_ranks = np.unique(ranks)
+        plt.hist(ranks, bins=len(unique_ranks), edgecolor='black', align='left')
+        plt.xticks(unique_ranks)
+        plt.xlabel('Rank')
+        plt.ylabel('Count')
+        plt.title('Distribution of Ranks')
+        
+        plt.tight_layout()
+        plt.savefig('Rank-Plot_'+dataset_name+'.png')
+        plt.close()
+
+    return ranks
+
+def k_umap(dados, target, N_NEIGHBOR,dataset_name):
     """
     Implementa o algoritmo UMAP com curvatura local
     """
@@ -360,41 +396,18 @@ def k_umap(dados, target, N_NEIGHBOR):
     m = dados.shape[1]
     c = len(np.unique(target))
     MIN_NEIGH = 3
-    # Calcula as curvaturas locais
+
     print("Calculando curvaturas locais")
-    K = curvature_estimation(dados, N_NEIGHBOR,"trace")
-    #print(curvaturas)
-    print("Normalizando curvaturas")
-    K = normalize_curvatures(K)
-    #print(min(K))
-    #print(max(K))
-    intervalos = np.linspace(min(K), max(K), N_NEIGHBOR-5)
-    quantis = np.quantile(K, intervalos)
-    bins = np.array(quantis)
-    # Discrete curvature values obtained after quantization (scores)
-    K = np.digitize(K, bins)
-    #K += 1
-    print(K)
-    #print(min(K))
-    #print(max(K))
-    #input()
-    # t = np.quantile(K, 0.5)
-    # for i, x in enumerate(K):
-        # if x <= t:
-            # K[i] = 0.2
-        # else:
-            # K[i] = 1
-    # t1 = np.quantile(K, 0.4)
-    # t2 = np.quantile(K, 0.6)
-    # for i, x in enumerate(K):
-        # if x <= t1:
-            # K[i] = 0.5
-        # elif x > t1 and x <= t2:
-            # K[i] = 1.0
-        # else:
-            # K[i] = 2.5
-    #K = np.tile(K, [2, 1])
-    #print(K.shape)
+    curvatures = curvature_estimation(dados, N_NEIGHBOR,"gaussian")
+
+    K = percentile_rank(curvatures,N_NEIGHBOR,dataset_name)
+
+    unique_values, counts = np.unique(K, return_counts=True)
+
+    print("Ranking de curvatura (Rank: Quantidade)")
+    for value, count in zip(unique_values, counts):
+        print(f"{value}: {count}")
+
     dist = np.square(euclidean_distances(dados,dados))
     rho = [sorted(dist[i])[1] for i in range(dist.shape[0])]
     # Computa a matriz no espaço de alta dimensionalidade   
@@ -422,7 +435,7 @@ def k_umap(dados, target, N_NEIGHBOR):
     np.random.seed(12345)
     # Laplacian Eigenmaps para inicialização das coordenadas dos pontos no espaço de baixa dimensão
     model = SpectralEmbedding(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)    
-    y = model.fit_transform(dados)
+    y = model.fit_transform(P)
     # Inicia a minimização da função de perda
     CE_array = []
     print("\nExecutando a descida do gradiente: \n")
@@ -466,150 +479,108 @@ def PlotaDados(dados, labels, metodo, dataset_name):
 
 def EvaluationMetrics(dados, target, method, N_NEIGHBOR):
     """
-    Computes performance evaluation metrics
+    Computes performance evaluation metrics.
+    Uses GMM for clustering and provides KNN classification scores
+    with 10-fold cross-validation, including standard deviation.
     """
-    print()
-    print('Quantitative metrics for %s features' %(method))
-    print()
-    
-    lista = []
-    lista_p = []
-    lista_r = []
-    lista_f1 = []
-    lista_j = []
-    lista_roc = []
-    lista_l = []
-    lista_k = []
-    
-    # 7 different classifiers
-    neigh = KNeighborsClassifier(n_neighbors=N_NEIGHBOR)
-    svm = SVC(gamma='auto')
-    nb = GaussianNB()
-    dt = DecisionTreeClassifier(random_state=42)
-    rfc = RandomForestClassifier()
-    
-    # 50% for training and 50% for testing
-    X_train, X_test, y_train, y_test = train_test_split(dados.real, target, train_size=0.5, random_state=42)
-    
-    # KNN
-    neigh.fit(X_train, y_train)
-    y_pred = neigh.predict(X_test)
-    acc = metrics.balanced_accuracy_score(y_pred, y_test)
-    lista.append(acc)
-    kappa = metrics.cohen_kappa_score(y_pred, y_test)
-    lista_k.append(kappa)
-    precision = metrics.precision_score(y_pred, y_test, average='weighted')
-    lista_p.append(precision)
-    recall = metrics.recall_score(y_pred, y_test, average='weighted')
-    lista_r.append(recall)
-    f1 = metrics.f1_score(y_pred, y_test, average='weighted')
-    lista_f1.append(f1)
-    jaccard = metrics.jaccard_score(y_pred, y_test, average='weighted')
-    lista_j.append(jaccard)
-    
-    # SMV
-    svm.fit(X_train, y_train)
-    y_pred = svm.predict(X_test)
-    acc = metrics.balanced_accuracy_score(y_pred, y_test)
-    lista.append(acc)
-    kappa = metrics.cohen_kappa_score(y_pred, y_test)
-    lista_k.append(kappa)
-    precision = metrics.precision_score(y_pred, y_test, average='weighted')
-    lista_p.append(precision)
-    recall = metrics.recall_score(y_pred, y_test, average='weighted')
-    lista_r.append(recall)
-    f1 = metrics.f1_score(y_pred, y_test, average='weighted')
-    lista_f1.append(f1)
-    jaccard = metrics.jaccard_score(y_pred, y_test, average='weighted')
-    lista_j.append(jaccard)
-        
-    # Naive Bayes
-    nb.fit(X_train, y_train)
-    y_pred = nb.predict(X_test)
-    acc = metrics.balanced_accuracy_score(y_pred, y_test)
-    lista.append(acc)
-    kappa = metrics.cohen_kappa_score(y_pred, y_test)
-    lista_k.append(kappa)
-    precision = metrics.precision_score(y_pred, y_test, average='weighted')
-    lista_p.append(precision)
-    recall = metrics.recall_score(y_pred, y_test, average='weighted')
-    lista_r.append(recall)
-    f1 = metrics.f1_score(y_pred, y_test, average='weighted')
-    lista_f1.append(f1)
-    jaccard = metrics.jaccard_score(y_pred, y_test, average='weighted')
-    lista_j.append(jaccard)
-    
-    # Decision Tree
-    dt.fit(X_train, y_train)
-    y_pred = dt.predict(X_test)
-    acc = metrics.balanced_accuracy_score(y_pred, y_test)
-    lista.append(acc)
-    kappa = metrics.cohen_kappa_score(y_pred, y_test)
-    lista_k.append(kappa)
-    precision = metrics.precision_score(y_pred, y_test, average='weighted')
-    lista_p.append(precision)
-    recall = metrics.recall_score(y_pred, y_test, average='weighted')
-    lista_r.append(recall)
-    f1 = metrics.f1_score(y_pred, y_test, average='weighted')
-    lista_f1.append(f1)
-    jaccard = metrics.jaccard_score(y_pred, y_test, average='weighted')
-    lista_j.append(jaccard)
-        
-    # Random Forest Classifier
-    rfc.fit(X_train, y_train)
-    y_pred = rfc.predict(X_test)
-    acc = metrics.balanced_accuracy_score(y_pred, y_test)
-    lista.append(acc)
-    kappa = metrics.cohen_kappa_score(y_pred, y_test)
-    lista_k.append(kappa)
-    precision = metrics.precision_score(y_pred, y_test, average='weighted')
-    lista_p.append(precision)
-    recall = metrics.recall_score(y_pred, y_test, average='weighted')
-    lista_r.append(recall)
-    f1 = metrics.f1_score(y_pred, y_test, average='weighted')
-    lista_f1.append(f1)
-    jaccard = metrics.jaccard_score(y_pred, y_test, average='weighted')
-    lista_j.append(jaccard)
-    
-    # GMM clustering
-    c = len(np.unique(target))
-    #labels_ = GaussianMixture(n_components=c, random_state=42).fit_predict(dados.real)
-    labels_ = KMeans(n_clusters=c).fit_predict(dados.real)
-    
-    # Computes the Silhoutte coefficient
-    sc = metrics.silhouette_score(dados.real, target, metric='euclidean')
-    ch = metrics.calinski_harabasz_score(dados.real, target)
-    db = metrics.davies_bouldin_score(dados.real, target)
-    fm = metrics.fowlkes_mallows_score(labels_, target)
-    ri = metrics.rand_score(labels_, target)
-    mi = metrics.mutual_info_score(labels_, target)
-    vm = metrics.v_measure_score(labels_, target)
-    
-    # Computes the average accuracy    
-    acc = max(lista)
-    precision = max(lista_p)
-    recall = max(lista_r)
-    f1 = max(lista_f1)
-    jac = max(lista_j)
-    kap = max(lista_k)    
+    print(f'\nQuantitative metrics for {method} features\n')
 
-    print('Silhouette coefficient: ', sc)
-    print('Calinski Harabasz: ', ch)
-    print('Davies Bouldin: ', db)
-    print('Rand index: ', ri)
-    print('Fowlkes Mallows score: ', fm)
-    print('Mutual info score: ', mi)
-    print('V-measure score: ', vm)
-    print('-----------------------------------')
-    print('Maximum balanced accuracy: ', acc)
-    print('Maximum kappa: ', kap)
-    print('Maximum precision: ', precision)
-    print('Maximum recall: ', recall)
-    print('Maximum F1 weighted: ', f1)
-    print('Maximum Jaccard: ', jac)
-    print()
+    if isinstance(dados, pd.Series):
+        X = dados.to_frame()
+    elif isinstance(dados, pd.DataFrame):
+        X = dados
+    else: 
+        X = pd.DataFrame(dados.real)
+
+    y = target
+
+    c = len(np.unique(y))
     
-    return [sc, ch, db, ri, fm, mi, vm, acc, kap, precision, recall, f1, jac]
+    gmm = GaussianMixture(n_components=c, random_state=42, n_init=10)
+    gmm_labels = gmm.fit_predict(X)
+
+    sc = metrics.silhouette_score(X, y, metric='euclidean')
+    ch = metrics.calinski_harabasz_score(X, y)
+    db = metrics.davies_bouldin_score(X, y)
+    
+    ri = metrics.rand_score(gmm_labels, y)
+    fm = metrics.fowlkes_mallows_score(gmm_labels, y)
+    mi = metrics.mutual_info_score(gmm_labels, y)
+    vm = metrics.v_measure_score(gmm_labels, y)
+
+    print(f'Silhouette coefficient: {sc:.4f}')
+    print(f'Calinski Harabasz: {ch:.4f}')
+    print(f'Davies Bouldin: {db:.4f}')
+    print(f'Rand index (GMM): {ri:.4f}')
+    print(f'Fowlkes Mallows score (GMM): {fm:.4f}')
+    print(f'Mutual info score (GMM): {mi:.4f}')
+    print(f'V-measure score (GMM): {vm:.4f}')
+    print('-----------------------------------\n')
+
+    clustering_results = {
+        'Silhouette': float(sc),
+        'Calinski_Harabasz': float(ch),
+        'Davies_Bouldin': float(db),
+        'Rand_index': float(ri),
+        'Fowlkes_Mallows': float(fm),
+        'Mutual_info': float(mi),
+        'V_measure': float(vm)
+    }
+
+    print(f'Evaluating KNN with 10-fold Cross-Validation...')
+    clf = KNeighborsClassifier(n_neighbors=N_NEIGHBOR)
+    kf = KFold(n_splits=10, shuffle=True, random_state=42)
+
+    balanced_accuracy_scores = []
+    kappa_scores = []
+    precision_scores = []
+    recall_scores = []
+    f1_scores = []
+    jaccard_scores = []
+
+    for train_index, test_index in kf.split(X):
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index] if isinstance(y, pd.Series) else y[train_index], \
+                          y.iloc[test_index] if isinstance(y, pd.Series) else y[test_index]
+        
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            balanced_accuracy_scores.append(metrics.balanced_accuracy_score(y_test, y_pred))
+            kappa_scores.append(metrics.cohen_kappa_score(y_test, y_pred))
+            precision_scores.append(metrics.precision_score(y_test, y_pred, average='weighted', zero_division=0))
+            recall_scores.append(metrics.recall_score(y_test, y_pred, average='weighted', zero_division=0))
+            f1_scores.append(metrics.f1_score(y_test, y_pred, average='weighted', zero_division=0))
+            jaccard_scores.append(metrics.jaccard_score(y_test, y_pred, average='weighted', zero_division=0))
+    
+    knn_classification_results = {
+        'Balanced_Accuracy_mean': float(np.mean(balanced_accuracy_scores)),
+        'Balanced_Accuracy_std': float(np.std(balanced_accuracy_scores)),
+        'Kappa_mean': float(np.mean(kappa_scores)),
+        'Kappa_std': float(np.std(kappa_scores)),
+        'Precision_weighted_mean': float(np.mean(precision_scores)),
+        'Precision_weighted_std': float(np.std(precision_scores)),
+        'Recall_weighted_mean': float(np.mean(recall_scores)),
+        'Recall_weighted_std': float(np.std(recall_scores)),
+        'F1_weighted_mean': float(np.mean(f1_scores)),
+        'F1_weighted_std': float(np.std(f1_scores)),
+        'Jaccard_weighted_mean': float(np.mean(jaccard_scores)),
+        'Jaccard_weighted_std': float(np.std(jaccard_scores))
+    }
+    
+    print(f"  Avg. Balanced Accuracy: {knn_classification_results['Balanced_Accuracy_mean']:.4f} (+/- {knn_classification_results['Balanced_Accuracy_std']:.4f})")
+    print(f"  Avg. Kappa: {knn_classification_results['Kappa_mean']:.4f} (+/- {knn_classification_results['Kappa_std']:.4f})")
+    print(f"  Avg. Precision: {knn_classification_results['Precision_weighted_mean']:.4f} (+/- {knn_classification_results['Precision_weighted_std']:.4f})")
+    print(f"  Avg. Recall: {knn_classification_results['Recall_weighted_mean']:.4f} (+/- {knn_classification_results['Recall_weighted_std']:.4f})")
+    print(f"  Avg. F1: {knn_classification_results['F1_weighted_mean']:.4f} (+/- {knn_classification_results['F1_weighted_std']:.4f})")
+    print(f"  Avg. Jaccard: {knn_classification_results['Jaccard_weighted_mean']:.4f} (+/- {knn_classification_results['Jaccard_weighted_std']:.4f})")
+    print()
+
+    merged_results = clustering_results | knn_classification_results
+
+    return merged_results
 
         
 def main():
@@ -619,9 +590,9 @@ def main():
     # Leitura dos dados
     #X = skdata.load_iris()     # 15 - all
     #X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
-    #X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
+    X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
-    X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
+    #X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
     #X = skdata.fetch_openml(name='page-blocks', version=1)      # 15 - all
     #X = skdata.fetch_openml(name='Kuzushiji-MNIST', version=1)  # 15 - all
     #X = skdata.fetch_openml(name='optdigits', version=1)        # 15 - all
@@ -716,7 +687,7 @@ def main():
     PlotaDados(dados_umap, target, 'UMAP', dataset_name)
 
     print('------------------------------------')
-    erro_k_umap, dados_k_umap = k_umap(dados, target, N_NEIGHBOR)
+    erro_k_umap, dados_k_umap = k_umap(dados, target, N_NEIGHBOR,dataset_name)
     PlotaDados(dados_k_umap, target, 'K-UMAP', dataset_name)
 
 
@@ -735,58 +706,27 @@ def main():
     print()
 
 
-    
-    # Métricas de avaliação para UMAP Euclidiano
     umap_metrics = EvaluationMetrics(dados_umap, target, 'UMAP (Euclidean)', N_NEIGHBOR)
-    # Métricas de avaliação para UMAP com distância de Mahalanobis
-    k_umap_metrics = EvaluationMetrics(dados_k_umap, target, 'K-UMAP', N_NEIGHBOR)
+    k_umap_metrics = EvaluationMetrics(dados_k_umap, target, 'SH-UMAP', N_NEIGHBOR)
 
 
-    # Novo resultado a ser adicionado
     new_result = {
-        dataset_name: {
-            'UMAP (Euclidean)': {
-                'Silhouette': umap_metrics[0],
-                'Calinski_Harabasz': umap_metrics[1],
-                'Davies_Bouldin': umap_metrics[2],
-                'Rand_index': umap_metrics[3],
-                'Fowlkes_Mallows': umap_metrics[4],
-                'Mutual_info': umap_metrics[5],
-                'V_measure': umap_metrics[6],
-                'Max_balanced_accuracy': umap_metrics[7],
-                'Max_kappa': umap_metrics[8],
-                'Max_precision': umap_metrics[9],
-                'Max_recall': umap_metrics[10],
-                'Max_F1_weighted': umap_metrics[11],
-                'Max_Jaccard': umap_metrics[12],
-            },
-            'K-UMAP': {
-                'Silhouette': k_umap_metrics[0],
-                'Calinski_Harabasz': k_umap_metrics[1],
-                'Davies_Bouldin': k_umap_metrics[2],
-                'Rand_index': k_umap_metrics[3],
-                'Fowlkes_Mallows': k_umap_metrics[4],
-                'Mutual_info': k_umap_metrics[5],
-                'V_measure': k_umap_metrics[6],
-                'Max_balanced_accuracy': k_umap_metrics[7],
-                'Max_kappa': k_umap_metrics[8],
-                'Max_precision': k_umap_metrics[9],
-                'Max_recall': k_umap_metrics[10],
-                'Max_F1_weighted': k_umap_metrics[11],
-                'Max_Jaccard': k_umap_metrics[12],
-            }
-        }
+    dataset_name: {
+        'UMAP (Euclidean)': dict(umap_metrics),
+        'SH-UMAP': dict(k_umap_metrics)
     }
-    # Verifica se o arquivo existe
+    }
+    
     if os.path.exists('resultados_umap.json'):
         with open('resultados_umap.json', 'r', encoding='utf-8') as f:
-            results = json.load(f)
+            try:
+                results = json.load(f)
+            except json.JSONDecodeError:
+                results = {}
         results.update(new_result)
     else:
         results = new_result
     with open('resultados_umap.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
-
-
 if __name__ == '__main__':
     main()

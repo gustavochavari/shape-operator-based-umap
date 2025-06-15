@@ -1,8 +1,9 @@
 '''
-    SH-UMAP: um algoritmo iterativo para aprendizado não supervisionado
-    de métricas baseado na curvatura local
+    SH-UMAP: UMAP adaptativo com curvatura local
+    Versão otimizada via Stochastic Gradient Descent
 
-    Protótipo em Python do método a ser desenvolvido
+    Authors: Gustavo H. Chavari and Alexandre L. M. Levada
+    Created: Tuesday, June 10, 2025, 10:55:12
 '''
 import numba
 import os
@@ -68,7 +69,6 @@ MAX_ITER = 120
 # FUNÇÕES AUXILIARES
 #####################################################
 
-# MODIFICADO: A função agora opera em um vetor de k distâncias, não em uma matriz completa.
 def prob_high_dim(dists_row, rho_i, sigma):
     """
      Para a linha de k-distâncias de um ponto, computa as probabilidades no espaço de alta dimensão.
@@ -95,7 +95,7 @@ def sigma_binary_search(k_of_sigma, fixed_k):
     sigma_upper_limit = 1000
     for i in range(64):
         approx_sigma = (sigma_lower_limit + sigma_upper_limit) / 2
-        # MODIFICADO: Adicionada verificação para evitar divisão por zero se approx_sigma for 0
+
         if approx_sigma == 0.0: return 0.0
         
         if k_of_sigma(approx_sigma) < fixed_k:
@@ -120,7 +120,6 @@ def f(x, min_dist):
     return y
 
 def find_ab_params(spread=1.0, min_dist=0.1):
-    """Fit a, b params for the UMAP low dimensional curve"""
     # Esta é a função que o UMAP tenta aproximar
     func = lambda x, a, b: 1.0 / (1.0 + a * x ** (2 * b))
 
@@ -180,11 +179,9 @@ def find_ab_params(spread=1.0, min_dist=0.1):
 # 
 #     return gradient
 
-# MODIFICADO: A função de gradiente em lote foi removida.
-# A função abaixo implementa a otimização via SGD.'
-# - MODIFICATION: Added the Numba JIT decorator. 
-#   This is the most important change for performance.
-#   fastmath=True allows for some floating point optimizations.
+# MODIFICADO
+# A função abaixo implementa a otimização via SGD
+# Também utiliza a otimização via NUMBA
 @numba.njit(fastmath=True)
 def umap_sgd_optimization(
     y_init,
@@ -198,11 +195,8 @@ def umap_sgd_optimization(
     log_loss=True
 ):
     """
-    Otimiza o embedding 'y' usando Descida de Gradiente Estocástica com amostragem negativa.
-    Esta versão é otimizada com Numba.
+    Otimiza o embedding usando Descida de Gradiente Estocástica com amostragem negativa.
     """
-    # - MODIFICATION: Explicitly copy and set the data type to float32.
-    #   This uses less memory and is often faster.
     y = y_init.copy().astype(np.float32)
     alpha = np.float32(initial_alpha)
     a = np.float32(a)
@@ -211,22 +205,16 @@ def umap_sgd_optimization(
     n = y.shape[0]
     n_edges = len(head)
 
-    # - MODIFICATION: Pre-allocate a NumPy array for loss history.
-    #   Appending to a Python list inside a Numba loop is inefficient.
     if log_loss:
         loss_history = np.zeros(n_epochs, dtype=np.float32)
 
-    # - MODIFICATION: Numba cannot use `tqdm` or `print`, so progress tracking is removed.
-    #   The loop will now run at maximum speed.
     for epoch in range(n_epochs):
-        # The learning rate decays linearly over the epochs
         current_alpha = alpha * (1.0 - epoch / float(n_epochs))
 
         if log_loss:
             attractive_loss = 0.0
             repulsive_loss = 0.0
 
-        # - MODIFICATION: More efficient permutation within Numba
         edge_indices = np.random.permutation(n_edges)
 
         for i in range(n_edges):
@@ -238,14 +226,14 @@ def umap_sgd_optimization(
 
             dist_sq = np.sum(np.square(y_h - y_t))
 
-            # --- Attractive Force ---
-            # q_ij is the low-dimensional similarity
+            # Força atrativa
+            # q_ij é a similaridade em baixa dimensão
             q_ij = 1.0 / (1.0 + a * (dist_sq ** b))
             
             if log_loss:
                 attractive_loss += np.log(q_ij + 1e-6)
 
-            # Gradient for attractive force
+            # Gradiente da força atrativa
             if dist_sq > 0.0:
                 grad_coeff = -2.0 * a * b * (dist_sq ** (b - 1.0))
                 grad_coeff /= (1.0 + a * (dist_sq ** b))
@@ -254,13 +242,14 @@ def umap_sgd_optimization(
             
             grad = grad_coeff * (y_h - y_t)
             
-            # - MODIFICATION: Apply gradient clipping for stability, a standard UMAP practice.
+            # Gradient clip para estabilidade (não entendi?)
             grad = np.clip(grad, -4.0, 4.0)
             
             y[h_idx] += grad * current_alpha
             y[t_idx] -= grad * current_alpha
 
-            # --- Repulsive Force ---
+            # Força repulsiva
+        
             for _ in range(n_neg_samples):
                 neg_idx = np.random.randint(0, n)
                 if neg_idx == h_idx:
@@ -269,13 +258,13 @@ def umap_sgd_optimization(
                 y_neg = y[neg_idx]
                 dist_sq_neg = np.sum(np.square(y_h - y_neg))
                 
-                # q_ik is the low-dimensional similarity for a negative sample
+                # q_ik é a similaridade em baixa dimensão para a amostra negativa
                 q_ik = 1.0 / (1.0 + a * (dist_sq_neg ** b))
                 
                 if log_loss:
                     repulsive_loss += np.log(1.0 - q_ik + 1e-6)
 
-                # Gradient for repulsive force
+                # Gradiente da força repulsiva
                 if dist_sq_neg > 0.0:
                     grad_coeff_neg = 2.0 * b
                     grad_coeff_neg /= (0.001 + dist_sq_neg) * (1.0 + a * (dist_sq_neg ** b))
@@ -284,7 +273,6 @@ def umap_sgd_optimization(
                 
                 grad_neg = grad_coeff_neg * (y_h - y_neg)
                 
-                # - MODIFICATION: Also apply gradient clipping here.
                 grad_neg = np.clip(grad_neg, -4.0, 4.0)
                 
                 y[h_idx] += grad_neg * current_alpha
@@ -296,7 +284,7 @@ def umap_sgd_optimization(
     if log_loss:
         return loss_history, y
     else:
-        # - MODIFICATION: Return an empty array if not logging loss to maintain output consistency.
+
         return np.array([0.0], dtype=np.float32), y
 
 def umap(dados, target, N_NEIGHBOR):
@@ -310,22 +298,22 @@ def umap(dados, target, N_NEIGHBOR):
     
     #### Constructing a local fuzzy simplicial set ####
 
-    # MODIFICADO: Usar NearestNeighbors para encontrar o grafo k-NN de forma eficiente.
+    # MODIFICADO: 
+    # Usar knn para encontrar o grafo 
     # Isso evita a criação de uma matriz de distância n x n completa.
     print("Construindo o grafo k-NN...")
     knn = NearestNeighbors(n_neighbors=N_NEIGHBOR, metric='euclidean')
     knn.fit(dados)
+
     # dist_knn e indices_knn são matrizes (n, k)
     dist_knn, indices_knn = knn.kneighbors(dados)
-    dist_knn = np.square(dist_knn) # UMAP usa distâncias quadráticas
+    dist_knn = np.square(dist_knn) # UMAP utiliza distâncias quadráticas
 
-    # MODIFICADO: Cálculo de rho de forma eficiente a partir das distâncias k-NN.
-    # rho é a distância para o vizinho mais próximo (diferente de si mesmo).
-    # Usamos [:, 1] pois o vizinho 0 é o próprio ponto com distância 0.
     rho = np.array([dist_knn[i][1] if dist_knn.shape[1] > 1 else 0.0 for i in range(dist_knn.shape[0])])
    
     sigma_array = []
-    # MODIFICADO: Inicializa a matriz de probabilidade como uma matriz esparsa.
+
+    # Inicializa a matriz de probabilidade como uma matriz esparsa.
     prob = lil_matrix((n, n), dtype=np.float32)
     
     print("Calculando similaridades no espaço de alta dimensão...")
@@ -333,13 +321,13 @@ def umap(dados, target, N_NEIGHBOR):
         # Extrai as distâncias e índices dos k-vizinhos para o ponto i
         dists_i = dist_knn[i]
         
-        # MODIFICADO: A função de probabilidade agora opera apenas nas k distâncias.
+        # A função de probabilidade agora opera apenas nas k distâncias.
         func = lambda sigma: k(prob_high_dim(dists_i, rho[i], sigma))
         binary_search_result = sigma_binary_search(func, N_NEIGHBOR)
         
         row_probs = prob_high_dim(dists_i, rho[i], binary_search_result)
         
-        # MODIFICADO: Preenche a matriz esparsa apenas para os vizinhos.
+        # Preenche a matriz esparsa apenas para os vizinhos.
         prob[i, indices_knn[i]] = row_probs
         
         sigma_array.append(binary_search_result)
@@ -348,7 +336,6 @@ def umap(dados, target, N_NEIGHBOR):
 
     P = (prob + prob.T).tocsr() / 2
     
-    # - MODIFICATION: Extract head and tail from the sparse matrix *before* calling the optimizer.
     P_coo = P.tocoo()
     head = P_coo.row
     tail = P_coo.col
@@ -359,12 +346,10 @@ def umap(dados, target, N_NEIGHBOR):
     np.random.seed(12345)
     print("Inicializando com Laplacian Eigenmaps...")
     model = SpectralEmbedding(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)
-    y_init = model.fit_transform(dados)
+    y_init = model.fit_transform(P)
     
     print("Otimizando layout...")
-    # - MODIFICATION: Call the new, fast JIT-compiled function.
-    #   We now wrap the call with tqdm to get the progress bar back.
-    #   Note that the progress bar will now be per-epoch, not per-sample.
+
     loss, y_final = umap_sgd_optimization(
         y_init,
         head,
@@ -441,7 +426,7 @@ def curvature_estimation(dados, k, method="gaussian"):
         #S += np.eye(m)/1e-6
 
         if method == "gaussian":
-            curvatures[i] = abs(np.linalg.det(S))
+            curvatures[i] = abs(np.linalg.det(S+np.eye(m)/1e-3))
         elif method == "mean":
             curvatures[i] = np.linalg.trace(S)
 
@@ -451,18 +436,17 @@ def calculate_entropy(data, n_bins):
     if n_bins >= len(data):
         return 0
 
-    # Use fixed-width bins across the data range
     bins = np.linspace(np.min(data), np.max(data), n_bins + 1)
     counts, _ = np.histogram(data, bins=bins)
 
-    # Normalize to get probabilities
     probs = counts / np.sum(counts)
-    probs = probs[probs > 0]  # Avoid log(0)
+    probs = probs[probs > 0]  
 
-    # Calculate Shannon entropy
+    # Shannon entropy
     entropy = -np.sum(probs * np.log2(probs))
     return entropy
 
+# Não é mais utilizado
 def normalize_curvatures(curv):
     """
     Normalize curvature values to [0, 1]
@@ -472,12 +456,12 @@ def normalize_curvatures(curv):
     else:
         return curv / len(curv)
 
-def percentile_rank(K, n_neighbors):
+def percentile_rank(K, n_neighbors,dataset_name,plot=True):
     """
     Assign ranks to K based on adaptive binning guided by entropy.
     """
     entropies = []
-    bin_range = range(3, min(n_neighbors - 1, len(K) // 2))
+    bin_range = range(3, n_neighbors - 1)
 
     for n_bins in bin_range:
         entropy = calculate_entropy(K, n_bins)
@@ -488,21 +472,44 @@ def percentile_rank(K, n_neighbors):
     else:
         entropies = np.array(entropies)
         if len(entropies) > 2:
-            # Use the elbow in the entropy curve
+            # Encontra o cotovelo
             second_deriv = np.diff(entropies, n=2)
             elbow_idx = np.argmax(second_deriv) + 1 if len(second_deriv) > 0 else 0
             n_bins = list(bin_range)[elbow_idx]
         else:
             n_bins = list(bin_range)[np.argmax(entropies)]
 
-    # Use fixed-width bins instead of quantile bins
     bins = np.linspace(np.min(K), np.max(K), n_bins)
     ranks = np.digitize(K, bins, right=False)
+
+    if plot:
+        plt.figure(figsize=(12, 5))
+        
+        # Entropia vs n_bins
+        plt.subplot(1, 2, 1)
+        plt.plot(bin_range, entropies, 'bo-')
+        plt.axvline(x=n_bins, color='r', linestyle='--', label=f'Selected n_bins = {n_bins}')
+        plt.xlabel('Number of bins')
+        plt.ylabel('Entropy')
+        plt.title('Entropy vs Number of Bins')
+        plt.legend()
+        
+        # Histograma
+        plt.subplot(1, 2, 2)
+        unique_ranks = np.unique(ranks)
+        plt.hist(ranks, bins=len(unique_ranks), edgecolor='black', align='left')
+        plt.xticks(unique_ranks)
+        plt.xlabel('Rank')
+        plt.ylabel('Count')
+        plt.title('Distribution of Ranks')
+        
+        plt.tight_layout()
+        plt.savefig('Rank-Plot_'+dataset_name+'.png')
 
     return ranks
     
 
-def k_umap(dados, target, N_NEIGHBOR):
+def k_umap(dados, target, N_NEIGHBOR,dataset_name):
     """
     Implementa o algoritmo UMAP com curvatura local
     """
@@ -522,33 +529,16 @@ def k_umap(dados, target, N_NEIGHBOR):
 
     rho = np.array([dist_knn[i][1] if dist_knn.shape[1] > 1 else 0.0 for i in range(dist_knn.shape[0])])
 
-    curvatures = curvature_estimation(dados, N_NEIGHBOR,"mean")
+    curvatures = curvature_estimation(dados, N_NEIGHBOR,"gaussian")
 
-    K = percentile_rank(curvatures,N_NEIGHBOR)
+    K = percentile_rank(curvatures,N_NEIGHBOR,dataset_name)
 
     unique_values, counts = np.unique(K, return_counts=True)
 
-    # Or combine them for better readability
     print("Ranking de curvatura (Rank: Quantidade)")
     for value, count in zip(unique_values, counts):
         print(f"{value}: {count}")
 
-    #print("Dist: ", dist_knn[0])
-    #print("Index: ", indices_knn[0])
-
-    #for i in range(n):
-        # Ensure we don't try to disconnect more neighbors than exist
-        #if K[i] < N_NEIGHBOR and K[i] > 0:
-        #    # Get the start slice index for disconnection
-        #    new_k = N_NEIGHBOR - K[i]
-        #
-        #    dist_knn[i] = dist_knn[i,:N_NEIGHBOR - K[i]]
-        #    indices_knn[i] = indices_knn[i,:N_NEIGHBOR - K[i]]
-
-    #print("Dist after: ", dist_knn[0,:N_NEIGHBOR - K[0]])
-    #print("Index after: ", indices_knn[0,:N_NEIGHBOR - K[0]])
-
-    # Fuzzy simplicial set
     print("Construindo o grafo k-NN...")
     
     prob = lil_matrix((n, n), dtype=np.float32)
@@ -560,7 +550,7 @@ def k_umap(dados, target, N_NEIGHBOR):
         
         func = lambda sigma: k(prob_high_dim(dists_i, rho[i], sigma))
         # A curvatura ajusta o número de vizinhos alvo na busca binária.
-        target_k = max(2, N_NEIGHBOR - K[i])
+        target_k = max(3, N_NEIGHBOR - K[i])
         binary_search_result = sigma_binary_search(func, target_k)
 
         prob[i, indices_knn[i,:N_NEIGHBOR - K[i]]] = prob_high_dim(dists_i, rho[i], binary_search_result)
@@ -570,7 +560,6 @@ def k_umap(dados, target, N_NEIGHBOR):
     
     P = (prob + prob.T).tocsr() / 2
     
-    # - MODIFICATION: Extract head and tail from the sparse matrix *before* calling the optimizer.
     P_coo = P.tocoo()
     head = P_coo.row
     tail = P_coo.col
@@ -581,12 +570,9 @@ def k_umap(dados, target, N_NEIGHBOR):
     np.random.seed(12345)
     print("Inicializando com Laplacian Eigenmaps...")
     model = SpectralEmbedding(n_components=N_LOW_DIMS, n_neighbors=N_NEIGHBOR)
-    y_init = model.fit_transform(dados)
+    y_init = model.fit_transform(P)
     
     print("Otimizando layout...")
-    # - MODIFICATION: Call the new, fast JIT-compiled function.
-    #   We now wrap the call with tqdm to get the progress bar back.
-    #   Note that the progress bar will now be per-epoch, not per-sample.
     loss, y_final = umap_sgd_optimization(
         y_init,
         head,
@@ -627,7 +613,6 @@ def PlotaDados(dados, labels, metodo, dataset_name):
     plt.title(f'{metodo} - Dataset: {dataset_name}')
     plt.xlabel('Dimensão 1')
     plt.ylabel('Dimensão 2')
-    #plt.legend() # A legenda pode poluir o gráfico com muitas classes
     plt.savefig(nome_arquivo)
     plt.close()
 
@@ -640,17 +625,16 @@ def EvaluationMetrics(dados, target, method, N_NEIGHBOR):
     """
     print(f'\nQuantitative metrics for {method} features\n')
 
-    # Ensure dados.real is a DataFrame for consistent indexing with KFold
     if isinstance(dados, pd.Series):
         X = dados.to_frame()
     elif isinstance(dados, pd.DataFrame):
         X = dados
-    else: # Assuming it's an object with a 'real' attribute that is array-like
+    else: 
         X = pd.DataFrame(dados.real)
 
     y = target
 
-    # --- Clustering Metrics (using GMM) ---
+    # GMM
     c = len(np.unique(y))
     
     gmm = GaussianMixture(n_components=c, random_state=42, n_init=10)
@@ -684,8 +668,7 @@ def EvaluationMetrics(dados, target, method, N_NEIGHBOR):
         'V_measure': float(vm)
     }
 
-    # --- Classification Metrics (KNN with 10-fold Cross-Validation) ---
-    print(f'Evaluating KNN with 10-fold Cross-Validation...')
+    print(f'Avaliação via KNN com 10-fold cross-validation...')
     clf = KNeighborsClassifier(n_neighbors=N_NEIGHBOR)
     kf = KFold(n_splits=10, shuffle=True, random_state=42)
 
@@ -713,7 +696,6 @@ def EvaluationMetrics(dados, target, method, N_NEIGHBOR):
             f1_scores.append(metrics.f1_score(y_test, y_pred, average='weighted', zero_division=0))
             jaccard_scores.append(metrics.jaccard_score(y_test, y_pred, average='weighted', zero_division=0))
     
-    # Calculate means and standard deviations
     knn_classification_results = {
         'Balanced_Accuracy_mean': float(np.mean(balanced_accuracy_scores)),
         'Balanced_Accuracy_std': float(np.std(balanced_accuracy_scores)),
@@ -747,7 +729,7 @@ def main():
 
     #X = skdata.load_iris()     # 15 - all
     #X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
-    #X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
+    X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='AP_Breast_Colon', version=1)  # 15 - all
     #X = skdata.fetch_openml(name='page-blocks', version=1)      # 15 - all
@@ -765,7 +747,7 @@ def main():
     #X = skdata.fetch_openml(name='semeion', version=1)          # sqrt - all
     #X = skdata.fetch_openml(name='micro-mass', version=1)       # sqrt - all
     #X = skdata.fetch_openml(name='MNIST_784', version=1)        # sqrt - all
-    X = skdata.fetch_openml(name='pendigits', version=1)        # sqrt - all
+    #X = skdata.fetch_openml(name='pendigits', version=1)        # sqrt - all
     #X = skdata.fetch_openml(name='satimage', version=1)         # sqrt - all
     #X = skdata.fetch_openml(name='dilbert', version=1)          # sqrt - all - 20%
     #X = skdata.fetch_openml(name='gina_agnostic', version=1)    # sqrt - all
@@ -808,9 +790,9 @@ def main():
     le = LabelEncoder()
     target = le.fit_transform(target)
 
-    if dados.shape[0] > 60000:
+    if dados.shape[0] > 15000:
         print(f"Dataset grande. Reduzindo de {dados.shape[0]} para 5000 amostras.")
-        dados, _, target, _ = train_test_split(dados, target, train_size=5000, random_state=42, stratify=target)
+        dados, _, target, _ = train_test_split(dados, target, train_size=0.2, random_state=42, stratify=target)
     
     dados = np.nan_to_num(dados)
     dados = preprocessing.scale(dados)
@@ -831,7 +813,7 @@ def main():
     
     print('\nSH-UMAP')
     print('------------------------------------')
-    erro_k_umap, dados_k_umap = k_umap(dados, target, N_NEIGHBOR)
+    erro_k_umap, dados_k_umap = k_umap(dados, target, N_NEIGHBOR,dataset_name)
     PlotaDados(dados_k_umap, target, 'SH-UMAP', dataset_name)
 
     plt.figure()

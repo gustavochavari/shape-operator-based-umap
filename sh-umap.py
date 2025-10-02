@@ -58,7 +58,7 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # Global configuration variables
 MIN_DIST = 0.1
 N_LOW_DIMS = 2
-N_EPOCHS = 1000
+N_EPOCHS = 200
 LEARNING_RATE = 1.0
 N_NEG_SAMPLES = 5 
 
@@ -149,7 +149,7 @@ def umap_sgd_optimization(
     log_loss=True
 ):
     """
-    Otimiza o embedding usando Descida de Gradiente Estocástica com amostragem negativa.
+    Otimiza o embedding usando Descida de Gradiente Estocástica.
     """
     y = y_init.copy().astype(np.float32)
     alpha = np.float32(initial_alpha)
@@ -196,7 +196,7 @@ def umap_sgd_optimization(
             
             grad = grad_coeff * (y_h - y_t)
             
-            # Gradient clip para estabilidade (não entendi?)
+            # Gradient clip para estabilidade 
             grad = np.clip(grad, -4.0, 4.0)
             
             y[h_idx] += grad * current_alpha
@@ -238,7 +238,6 @@ def umap_sgd_optimization(
     if log_loss:
         return loss_history, y
     else:
-
         return np.array([0.0], dtype=np.float32), y
 
 def umap(dados, target, N_NEIGHBOR):
@@ -319,6 +318,7 @@ def umap(dados, target, N_NEIGHBOR):
     print("UMAP Finalizado.")
     return (loss, y_final)
 
+#graph atention networks article
 
 def curvature_estimation(dados, k, method="gaussian"):
     """
@@ -376,11 +376,10 @@ def curvature_estimation(dados, k, method="gaussian"):
         II = np.dot(H, H.T)
 
         # Shape Operator
-        S = -np.dot(II, I)
-        #S += np.eye(m)/1e-6
+        S = np.dot(II, I) 
 
         if method == "gaussian":
-            curvatures[i] = abs(np.linalg.det(S+np.eye(m)/1e-3))
+            sign , curvatures[i] = np.linalg.slogdet(S)
         elif method == "mean":
             curvatures[i] = np.linalg.trace(S)
 
@@ -409,13 +408,35 @@ def normalize_curvatures(curv):
         return (curv - curv.min()) / (curv.max() - curv.min())
     else:
         return curv / len(curv)
+    
+def quantize(array,a,b,k=10,dataset_name=None,plot=True):
+    arr_clipped = np.clip(array,a,b) #garante que todos os valores estejam em [a,b]
+    normalized = (arr_clipped - a)/(b-a) #escala para o intervalo [0,1]
+    quantized = (normalized*k).astype(int) #escala para o intervalo [0,k] e converte para inteiro
+    quantized = np.clip(quantized,0,k-1)
 
-def percentile_rank(K, n_neighbors,dataset_name,plot=True):
+    if plot:
+        plt.figure(figsize=(12, 5))
+        unique_ranks = np.unique(quantized)
+        plt.hist(quantized,bins=len(unique_ranks),edgecolor='black', align='left')
+        plt.xlabel('N-Neighbors')
+        plt.ylabel('Count')
+        plt.title('Quantized Curvature Distribution')
+        plt.legend()
+        
+        
+        plt.tight_layout()
+        plt.savefig('Quantize-Plot_'+dataset_name+'.png')
+        plt.close()
+
+    return quantized
+
+def percentile_rank(K, n_neighbors,dataset_name=None,plot=True):
     """
     Assign ranks to K based on adaptive binning guided by entropy.
     """
     entropies = []
-    bin_range = range(3, n_neighbors - 1)
+    bin_range = range(10, n_neighbors - 1)
 
     for n_bins in bin_range:
         entropy = calculate_entropy(K, n_bins)
@@ -459,11 +480,12 @@ def percentile_rank(K, n_neighbors,dataset_name,plot=True):
         
         plt.tight_layout()
         plt.savefig('Rank-Plot_'+dataset_name+'.png')
+        plt.close()
 
     return ranks
     
 
-def k_umap(dados, target, N_NEIGHBOR,dataset_name):
+def k_umap(dados, target, N_NEIGHBOR, metric, dataset_name, rank_method="percentile"):
     """
     Implementa o algoritmo UMAP com curvatura local
     """
@@ -472,44 +494,40 @@ def k_umap(dados, target, N_NEIGHBOR,dataset_name):
     print('*************************************************\n')
     n = dados.shape[0]
     c = np.unique(target)
-    
     print("Calculando curvaturas locais...")
-
+    print("Métrica: ", metric)
+    print("Rank method: ", rank_method)
 
     knn = NearestNeighbors(n_neighbors=N_NEIGHBOR, metric='euclidean')
     knn.fit(dados)
     dist_knn, indices_knn = knn.kneighbors(dados)
     dist_knn = np.square(dist_knn)
-
     rho = np.array([dist_knn[i][1] if dist_knn.shape[1] > 1 else 0.0 for i in range(dist_knn.shape[0])])
+    curvatures = curvature_estimation(dados, N_NEIGHBOR, metric)
 
-    curvatures = curvature_estimation(dados, N_NEIGHBOR,"gaussian")
-
-    K = percentile_rank(curvatures,N_NEIGHBOR,dataset_name)
+    if rank_method == "percentile":
+        K = percentile_rank(curvatures, N_NEIGHBOR, dataset_name)
+    elif rank_method == "quantize":
+        K = quantize(curvatures, min(curvatures), max(curvatures), N_NEIGHBOR-1, dataset_name)
+    else:
+        raise ValueError(f"Unknown rank_method: {rank_method}")
 
     unique_values, counts = np.unique(K, return_counts=True)
-
     print("Ranking de curvatura (Rank: Quantidade)")
     for value, count in zip(unique_values, counts):
         print(f"{value}: {count}")
 
-    print("Construindo o grafo k-NN...")
-    
+    print("Construindo representação simplicial...")
     prob = lil_matrix((n, n), dtype=np.float32)
     sigma_array = []
-    
     print("Calculando similaridades no espaço de alta dimensão...")
     for i in tqdm(range(n), desc="Busca binária do Sigma (com curvatura)"):
         dists_i = dist_knn[i,:N_NEIGHBOR - K[i]]
-        
         func = lambda sigma: k(prob_high_dim(dists_i, rho[i], sigma))
-        # A curvatura ajusta o número de vizinhos alvo na busca binária.
         target_k = max(3, N_NEIGHBOR - K[i])
         binary_search_result = sigma_binary_search(func, target_k)
-
         prob[i, indices_knn[i,:N_NEIGHBOR - K[i]]] = prob_high_dim(dists_i, rho[i], binary_search_result)
         sigma_array.append(binary_search_result)
-
     print(f"Sigma médio = {np.mean(sigma_array)}")
     
     P = (prob + prob.T).tocsr() / 2
@@ -563,11 +581,10 @@ def PlotaDados(dados, labels, metodo, dataset_name):
         cor = cores[i % len(cores)]
         plt.scatter(dados[indices, 0], dados[indices, 1], c=cor, alpha=0.6, marker='.', label=f'Classe {i}') 
     
-    nome_arquivo = metodo+'_'+dataset_name + '.png'
+    nome_arquivo = metodo+'_'+dataset_name + '.pdf'
     plt.title(f'{metodo} - Dataset: {dataset_name}')
-    plt.xlabel('Dimensão 1')
-    plt.ylabel('Dimensão 2')
-    plt.savefig(nome_arquivo)
+    plt.axis('off')
+    plt.savefig(nome_arquivo, dpi=300, format='pdf')
     plt.close()
 
 
@@ -681,7 +698,12 @@ def EvaluationMetrics(dados, target, method, N_NEIGHBOR):
 def main():
     warnings.simplefilter(action='ignore')
 
+    
+    # torus = np.array(pd.read_csv('torus_link_data.csv')
+    #X = {'data':torus[:,:3],'target':torus[:,3],'details':{'name':'Torus_Link'}}
+
     #X = skdata.load_iris()     # 15 - all
+    #X = skdata.load_digits()
     #X = skdata.fetch_openml(name='penguins', version=1)         # 15 - all
     X = skdata.fetch_openml(name='mfeat-karhunen', version=1)   # 15 - all
     #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)   # 15 - all
@@ -694,9 +716,10 @@ def main():
     #X = skdata.fetch_openml(name='schizo', version=1)              # 15 - all
     #X = skdata.fetch_openml(name='11_Tumors', version=1)           # 15 - all
     #X = skdata.fetch_openml(name='one-hundred-plants-margin', version=1)   # 15 - all
+    #X = skdata.fetch_openml(name='Brain-cancer-gene-expression---CuMiDa', version=1)
 
     #X = skdata.load_digits()    # sqrt - all
-    #X = skdata.fetch_openml(name='mfeat-fourier', version=1)    # sqrt - all
+    # #X = skdata.fetch_openml(name='mfeat-fourier', version=1)    # sqrt - all
     #X = skdata.fetch_openml(name='mfeat-factors', version=1)    # sqrt - all
     #X = skdata.fetch_openml(name='semeion', version=1)          # sqrt - all
     #X = skdata.fetch_openml(name='micro-mass', version=1)       # sqrt - all
@@ -705,6 +728,8 @@ def main():
     #X = skdata.fetch_openml(name='satimage', version=1)         # sqrt - all
     #X = skdata.fetch_openml(name='dilbert', version=1)          # sqrt - all - 20%
     #X = skdata.fetch_openml(name='gina_agnostic', version=1)    # sqrt - all
+    #X = skdata.fetch_openml(name='hiva_agnostic', version=1)
+    #X = skdata.fetch_openml(name='Bioresponse', version=1)
     #X = skdata.fetch_openml(name='vowel', version=1)            # sqrt - all
 
     #X = skdata.fetch_openml(name='cars', version=1)     # sqrt - classif
@@ -712,6 +737,7 @@ def main():
     #X = skdata.fetch_openml(name='gas-drift', version=1)   # sqrt - classif
     #X = skdata.fetch_openml(name='gisette', version=1)     # sqrt - classif
     #X = skdata.fetch_openml(name='OVA_Breast', version=1)      # sqrt - classif
+    #X = skdata.fetch_openml(name='AP_Endometrium_Ovary', version=1)
     #X = skdata.fetch_openml(name='ionosphere', version=1)      # sqrt - classif
     #X = skdata.fetch_openml(name='LED-display-domain-7digit', version=1)    # sqrt - classif
     #X = skdata.fetch_openml(name='yeast', version=1)       # sqrt - classif
@@ -725,8 +751,11 @@ def main():
     #X = skdata.fetch_openml(name='steel-plates-fault', version=1)      # 15 - classif
 
     #X = skdata.fetch_openml(name='BurkittLymphoma', version=1) # 15 - cluster
+    #X = skdata.fetch_openml(name='AP_Omentum_Kidney', version=1)
+    #X = skdata.fetch_openml(name='AP_Endometrium_Kidney', version=1)
+    #X = skdata.fetch_openml(name='COIL-20', version=1)
 
-    dataset_name = X.get('details', {}).get('name', 'NoName') + "SHMOD"
+    dataset_name = X.get('details', {}).get('name', 'Nme') 
     print(f"Carregando dataset: {dataset_name}\n")
 
     dados = X['data']
@@ -745,7 +774,7 @@ def main():
     target = le.fit_transform(target)
 
     if dados.shape[0] > 15000:
-        print(f"Dataset grande. Reduzindo de {dados.shape[0]} para 5000 amostras.")
+        print(f"Dataset grande. Reduzindo de {dados.shape[0]} para 50% de amostras.")
         dados, _, target, _ = train_test_split(dados, target, train_size=0.2, random_state=42, stratify=target)
     
     dados = np.nan_to_num(dados)
@@ -756,55 +785,94 @@ def main():
 
     #N_NEIGHBOR = int(np.round(np.log2(n)))
     N_NEIGHBOR = int(np.round(np.sqrt(n)))
-    print(f'Datasetname = {dataset_name}')
+
     print(f'N = {n}')
     print(f'M = {m}')
     print(f'C = {c}')
     print(f'K = {N_NEIGHBOR}\n')
 
-    erro_umap, dados_umap = umap(dados, target, N_NEIGHBOR)
-    PlotaDados(dados_umap, target, 'UMAP', dataset_name)
-    
-    print('\nSH-UMAP')
-    print('------------------------------------')
-    erro_k_umap, dados_k_umap = k_umap(dados, target, N_NEIGHBOR,dataset_name)
-    PlotaDados(dados_k_umap, target, 'SH-UMAP', dataset_name)
+    output_base = f"{dataset_name}_k{N_NEIGHBOR}_ep{N_EPOCHS}"
 
-    plt.figure()
-    START=8
-    plt.plot(erro_umap[START:], c='red', label='UMAP (Euclidean)', alpha=0.7)
-    plt.plot(erro_k_umap[START:], c='blue', label='SH-UMAP', alpha=0.7)
-    plt.title("Convergência da Entropia Cruzada", fontsize=12)
-    plt.xlabel("Iteração", fontsize=12)
-    plt.ylabel("Entropia Cruzada", fontsize=12)
-    plt.legend()
-    plt.savefig('Cross-Entropy_'+dataset_name+'.png')
-    plt.close()
-
-    print('\nMétricas de avaliação de qualidade de agrupamento e classificação')
-    print('-------------------------------------------------------------------')
-    
-    umap_metrics = EvaluationMetrics(dados_umap, target, 'UMAP (Euclidean)', N_NEIGHBOR)
-    k_umap_metrics = EvaluationMetrics(dados_k_umap, target, 'SH-UMAP', N_NEIGHBOR)
-
-
-    new_result = {
-    dataset_name: {
-        'UMAP (Euclidean)': dict(umap_metrics),
-        'SH-UMAP': dict(k_umap_metrics)
-    }
-    }
-    
-    if os.path.exists('novos_resultados_shumap.json'):
-        with open('novos_resultados_shumap.json', 'r', encoding='utf-8') as f:
+    # Load previous results if available
+    results = {}
+    if os.path.exists('SIBGRAPI_shumap_final_results.json'):
+        with open('SIBGRAPI_shumap_final_results.json', 'r', encoding='utf-8') as f:
             try:
                 results = json.load(f)
             except json.JSONDecodeError:
                 results = {}
-        results.update(new_result)
+    if dataset_name not in results:
+        results[dataset_name] = {}
+
+    # --- UMAP ---
+    umap_key = f'UMAP_{output_base}'
+    if umap_key not in results[dataset_name]:
+        erro_umap, dados_umap = umap(dados, target, N_NEIGHBOR)
+        PlotaDados(dados_umap, target, 'UMAP', output_base)
+        umap_metrics = EvaluationMetrics(dados_umap, target, umap_key, N_NEIGHBOR)
+        results[dataset_name][umap_key] = umap_metrics
     else:
-        results = new_result
-    with open('novos_resultados_shumap.json', 'w', encoding='utf-8') as f:
+        dados_umap = None  # Not needed if not plotting together
+
+    # --- SHUMAP (gaussian and mean, both rank methods) ---
+    for metric in ("gaussian", "mean"):
+        rank_method = 'quantize'
+        shumap_key = f'SH-UMAP_{output_base}_{metric}_{rank_method}'
+        if shumap_key not in results[dataset_name]:
+            erro_k_umap, dados_k_umap = k_umap(dados, target, N_NEIGHBOR, metric, f'{output_base}_{metric}_{rank_method}', rank_method=rank_method)
+            PlotaDados(dados_k_umap, target, 'SH-UMAP', f'{output_base}_{metric}_{rank_method}')
+            k_umap_metrics = EvaluationMetrics(dados_k_umap, target, shumap_key, N_NEIGHBOR)
+            results[dataset_name][shumap_key] = k_umap_metrics
+            plt.figure()
+            START=0
+            # Convert to numpy arrays if they aren't already
+            erro_umap_array = erro_umap
+            erro_k_umap_array = erro_k_umap
+            
+            # Define window size
+            window_size = 101
+            
+            def moving_average(data, window):
+                return pd.Series(data).rolling(window=window, center=True).mean().dropna().values
+            
+            
+            # Calculate rolling means (result will be shorter by window_size-1 elements)
+            aux_mean_erro_umap = np.roll(moving_average(erro_umap_array, window_size),50)
+            aux_mean_erro_k_umap = np.roll(moving_average(erro_k_umap_array, window_size),50)
+            
+            # --- Plotting Code ---
+            
+            plt.figure(figsize=(7, 5)) # Increased figure size for better visualization
+            
+            # Plot original loss lines with reduced alpha to obfuscate them
+            if dados_umap is not None:
+                plt.plot(erro_umap[START:len(aux_mean_erro_umap)], c='#808080', alpha=0.2)
+            plt.plot(erro_k_umap[START:len(aux_mean_erro_k_umap)-10], c='#007ACC', alpha=0.2)
+        
+            
+            # Plot the ROLLING MEAN lines
+            if dados_umap is not None:
+                if len(aux_mean_erro_umap) > 0:
+                    plt.plot(aux_mean_erro_umap[START:],
+                             color='#808080', linestyle='--', linewidth=2, label=f'UMAP')
+            
+            if len(aux_mean_erro_k_umap) > 0:
+                plt.plot(aux_mean_erro_k_umap[START:],
+                         color='#007ACC', linestyle='-', linewidth=2, label=f'SH-UMAP')
+            
+            
+            plt.title(f"Actual Loss in {dataset_name} Dataset", fontsize=14)
+            plt.xlabel("Epoch", fontsize=12)
+            plt.ylabel("Loss", fontsize=12)
+            plt.xlim(50,len(erro_k_umap)-101)
+            plt.ylim(min(aux_mean_erro_k_umap)-0.15,max(aux_mean_erro_umap)+0.15)
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout() # Adjust layout to prevent labels overlapping
+            plt.savefig(f'Actual-Loss_{shumap_key}.pdf', dpi=300, format='pdf')
+            plt.close()
+                
+    with open('SIBGRAPI_shumap_final_results.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
 
 if __name__ == '__main__':

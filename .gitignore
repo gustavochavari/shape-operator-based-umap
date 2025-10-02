@@ -2,3 +2,5 @@
 images/
 notebooks/
 sh_images/
+old_results/
+__pycache__/
